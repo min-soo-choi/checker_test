@@ -2451,7 +2451,7 @@ with tab_about:
 
 ---
 """)
-    with tab2:
+    with tab4:
         st.markdown("""
 # ✏️ 해설 텍스트 변환
 
