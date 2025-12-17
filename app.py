@@ -1862,6 +1862,290 @@ with tab_about:
     st.title("📘 텍스트 자동 검수기 설명서")
     st.caption("이 탭은 전체 앱의 구조와 동작 방식을 설명합니다.")
     # (원문 그대로 두면 됨 — 기능 영향 없음)
+    about_sections = {
+        "✨ 앱 소개": """
+## ✨ 이 앱은 무엇을 하나요?
+
+이 앱은 **한국어/영어 단일 텍스트 검수기**와  
+**Google Sheets 기반 배치 검수기**를 포함한 **통합 자동 검수 플랫폼**입니다.
+
+- 자연스러움, 문체, 표현 개선 등 **주관적 수정은 전혀 하지 않습니다.**  
+- 오직 **객관적으로 검증 가능한 오류만** 검출합니다.  
+- 모든 검수는 **JSON-only 응답 + 후처리 안정화 로직** 기반으로 작동하여  
+  오탐(False Positive)과 누락을 최소화합니다.
+
+---
+""",
+        "✏️ 한국어 검수": """
+# ✏️ 한국어 검수 (Korean Proofreading)
+
+## 🔍 기능 개요
+한국어 텍스트에서 다음과 같은 **형식적·명백한 오류**만 검출합니다:
+
+**검출하는 오류**
+- 오탈자 / 반복 문자  
+- 조사·어미 오류  
+- 명백한 띄어쓰기 오류  
+- 문장부호 오류  
+  - 종결부호 누락  
+  - 따옴표 짝 불일치  
+  - 이상한 쉼표·마침표  
+- (옵션) 단어 내부 분리 오류 (`된 다` → `된다`)
+
+**검출하지 않는 항목**
+- 자연스러운 표현 변경  
+- 의미가 달라질 가능성이 있는 수정  
+- 문장 재작성 수준의 교정  
+- escape/markdown 기반 가짜 오류  
+
+---
+
+## 🧠 작동 방식
+
+1. **한국어 전용 프롬프트 생성**  
+   - "원문 의미 보존" 원칙을 강하게 명시  
+   - 예시 토큰 출력 금지  
+2. **Gemini(JSON mode, temperature=0)** 호출  
+3. **후처리 단계**  
+   - 스타일 제안 제거  
+   - 존재하지 않는 '원문' 기반 수정 제거  
+   - escape 기반 오류 제거  
+   - 종결부호·따옴표 관련 오탐 제거  
+   - plain / markdown 오류 분리  
+4. **최종 출력**  
+   - suspicion_score (1~5)  
+   - translated_typo_report  
+   - raw vs final JSON 비교 가능
+
+---
+
+## 🧪 2-패스 구조 (Detector → Judge)
+- **1차 Detector**: 가능한 많은 오류 후보를 넓게 탐지 (약간 과검출 허용)
+- **2차 Judge**: 의미 변경/스타일 제안/환각을 필터링해 **객관적 오류만 남김**
+- UI에서 Detector/Judge/Final을 각각 선택해 하이라이트와 리포트를 비교할 수 있습니다.
+
+---
+""",
+        "✏️ 영어 검수": """
+# ✏️ 영어 검수 (English Proofreading)
+
+## 🔍 기능 개요
+영어 텍스트의 **객관적 오류만** 탐지합니다.
+
+**검출하는 오류**
+- 스펠링 오류  
+- split-word 오류 (`wi th`, `o f` 등)  
+- AI 문맥에서 `Al` → `AI` 오표기  
+- 대문자 규칙 위반  
+- 중복 단어  
+- 종결부호 누락  
+
+**검출하지 않는 항목**
+- 스타일·표현 개선  
+- 자연스러운 문장으로의 재작성  
+- 마크다운/escape 기반 오류  
+
+---
+
+## 🧠 작동 방식
+
+1. **영어 전용 프롬프트 생성**
+2. **Gemini(JSON mode)** 호출  
+3. **후처리**  
+   - self-equal 라인 제거  
+   - 원문 미존재 토큰 제거  
+   - 가짜 종결부호 오류 제거  
+   - 스타일 제안 차단  
+4. plain / markdown 오류 분리
+
+**출력 요소**
+- suspicion_score  
+- content_typo_report  
+- raw JSON / final JSON / diff
+
+---
+""",
+        "🧰 국어 작업": """
+# 🧰 국어 작업 (KO Work)
+
+## 🔍 기능 개요
+OCR 텍스트를 과목 기준에 맞게 **들여쓰기/줄바꿈** 형태로 정리합니다.
+
+**주요 기능**
+- **1. 시트 검색 작품 들여쓰기**: 시트에서 가져온 작품을 기준으로 정리  
+  - 시: 줄바꿈만 정규화 (들여쓰기 없음)  
+  - 시 이외: 줄바꿈 유지 + 각 줄 시작 1칸 들여쓰기
+- **2. PDF 작품 들여쓰기**: PDF OCR 텍스트를 문학 갈래별로 정리  
+  - 문학-운문: anchors 기준 줄바꿈  
+  - 문학-산문: anchors 기준 문단 구분 + 들여쓰기  
+  - 문학 이외: 입력 줄바꿈 유지 + 들여쓰기
+
+---
+""",
+        "🧰 영어 작업": """
+# 🧰 영어 작업 (EN Work)
+
+## 🔍 기능 개요
+시험 지문/보기/문항을 **표준 규칙에 맞게 변환**합니다.
+
+**주요 기능**
+- 원기호/원문자 통일 및 괄호 정리  
+- 정답 라벨 정렬 (A/a)  
+- 양자택일 괄호 변경 + 라벨 부여  
+- 괄호 안 단어 배열 정규화  
+- 보기 단어배열 정리  
+- 밑줄 라벨링
+
+**공통 옵션**
+- `[...]`를 `<strong>`로 감싸기 (모든 기능에 적용)
+
+---
+""",
+        "📄 해설 텍스트 정리": """
+# ✏️ 해설 텍스트 변환
+
+## 🔍 기능 개요
+해설 텍스트를 **[정답 해설] / [오답 해설]** 양식에 맞게 변환합니다.
+
+- **[출제 유형] ~** 삭제됩니다.
+- 정답인 이유/답이 아닌 이유 형식은 **[정답 해설] / [오답 해설]** 양식으로 변환됩니다.
+
+---
+
+## 🧠 작동 방식
+
+1. PDF에서 OCR한 텍스트를 넣어줍니다.
+2. 텍스트 정리 실행 버튼을 클릭합니다.
+3. 변환된 텍스트를 PDF와 비교 후 일치할 경우 복사해서 해설 영역에 넣어주세요.
+
+---
+""",
+        "🎯 철학 & 규칙": """
+# 🎯 전체 시스템 철학 및 규칙
+
+## ✔ 의미 보존 원칙
+모든 검수 로직은  
+**“원문의 의미와 의도를 절대 바꾸지 않는다”**  
+를 최우선 원칙으로 합니다.
+
+---
+
+## ✔ Hallucination 방지
+- `'원문'`은 반드시 실제 텍스트에 존재해야 함  
+- JSON-only 응답  
+- 예시 토큰(AAA 등) 출력 금지  
+- 스타일·문체 제안 전부 제거  
+
+---
+
+## ✔ 목표
+- **객관적 오류만 정확하게 검출**  
+- 후처리로 오탐 최소화  
+- plain/markdown을 분리하여 출처를 명확하게 표현  
+
+---
+""",
+    }
+    
+    selected_section = st.radio(
+        "섹션 선택",
+        options=list(about_sections.keys()),
+        horizontal=True,
+        key="about_section_selector",
+    )
+
+    st.markdown(about_sections.get(selected_section, ""))
+
+    def _render_example(title: str, input_text: str, output_text: str, anchors_text: str | None = None):
+        st.markdown(f"#### {title}")
+        if anchors_text:
+            st.markdown("**anchors**")
+            st.code(anchors_text, language="text")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**입력**")
+            st.code(input_text, language="text")
+        with c2:
+            st.markdown("**출력**")
+            st.code(output_text, language="text")
+
+    if selected_section == "🧰 국어 작업":
+        st.subheader("✅ 예시")
+        _render_example(
+            "1. 시트 검색 작품 들여쓰기 (시)",
+            "봄이 온다\n꽃이 핀다",
+            "봄이 온다\n꽃이 핀다",
+        )
+        st.divider()
+        _render_example(
+            "1. 시트 검색 작품 들여쓰기 (시 이외)",
+            "첫 문장입니다.\n둘째 문장입니다.",
+            " 첫 문장입니다.\n 둘째 문장입니다.",
+        )
+        st.divider()
+        _render_example(
+            "2. PDF 작품 들여쓰기 (문학-운문)",
+            "웃지 마라 검을소냐 하노라",
+            "웃지 마라\n검을소냐\n하노라",
+            anchors_text="웃지 마라\n검을소냐\n하노라",
+        )
+        st.divider()
+        _render_example(
+            "2. PDF 작품 들여쓰기 (문학-산문)",
+            "나는 말했다. 그는 들었다.",
+            " 나는 말했다.\n 그는 들었다.",
+            anchors_text="말했다.\n들었다.",
+        )
+        st.divider()
+        _render_example(
+            "2. PDF 작품 들여쓰기 (문학 이외)",
+            "첫 줄\n둘째 줄",
+            " 첫 줄\n 둘째 줄",
+        )
+
+    if selected_section == "🧰 영어 작업":
+        st.subheader("✅ 예시")
+        _render_example(
+            "원기호/원문자 통일",
+            "① apple ② banana",
+            "(①) apple (②) banana",
+        )
+        st.divider()
+        _render_example(
+            "정답 라벨 정렬 (A/a)",
+            "apple, banana, cherry",
+            "(A) apple    (B) banana    (C) cherry",
+        )
+        st.divider()
+        _render_example(
+            "양자택일 괄호 변경 + 라벨 부여",
+            "Choose (red, blue).",
+            "Choose (A) [ red / blue ].",
+        )
+        st.divider()
+        _render_example(
+            "괄호 안 단어 배열 정규화",
+            "Choose (a, b, c).",
+            "Choose [ a / b / c ].",
+        )
+        st.divider()
+        _render_example(
+            "보기 단어배열 정리",
+            "apple, banana, cherry",
+            "apple / banana / cherry",
+        )
+        st.divider()
+        _render_example(
+            "밑줄 라벨링",
+            "The _____ dog",
+            "The (A)__________ dog",
+        )
+        st.divider()
+        _render_example(
+            "공통 옵션: [...] → <strong>",
+            "Answer [A]",
+            "Answer <strong>[A]</strong>",
+        )
 
 
 # --- 디버그 탭: ✅ 세션 누적 정산 현황만 추가 (기능 영향 없음) ---

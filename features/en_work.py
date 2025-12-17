@@ -31,7 +31,10 @@ def run_action(action_key: str, text: str, params: dict) -> WorkResult:
     if not fn:
         return WorkResult(ok=False, title="실행 실패", output_text="", error=f"Unknown action: {action_key}")
     try:
-        return fn(text, params)
+        result = fn(text, params)
+        if result.ok and params.get("strong_brackets"):
+            result.output_text = apply_strong_brackets(result.output_text)
+        return result
     except Exception as e:
         return WorkResult(ok=False, title="실행 실패", output_text="", error=str(e))
 
@@ -82,7 +85,7 @@ def highlight_diff_html(before: str, after: str) -> Tuple[str, str]:
 def wrap_pre_block(inner_html: str) -> str:
     return (
         "<div style='background:#f7f7f7; border:1px solid #e5e5e5; "
-        "border-radius:8px; padding:12px;'>"
+        "border-radius:8px; padding:12px; white-space: pre-wrap;'>"
         "<pre style='white-space: pre-wrap; margin:0; font-weight:400;'>"
         f"{inner_html}"
         "</pre></div>"
@@ -119,6 +122,25 @@ def render_strong_html(text: str) -> str:
 
     # 줄바꿈은 <br>로
     tmp = tmp.replace("\n", "<br>")
+
+    return tmp
+
+
+def apply_strong_brackets(text: str) -> str:
+    if not text:
+        return text
+
+    strong_blocks: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        strong_blocks.append(m.group(0))
+        return f"__STRONG_BLOCK_{len(strong_blocks)-1}__"
+
+    tmp = re.sub(r"<strong>.*?</strong>", _stash, text, flags=re.DOTALL | re.IGNORECASE)
+    tmp = re.sub(r"\[([^\]]+)\]", r"<strong>[\1]</strong>", tmp)
+
+    for i, block in enumerate(strong_blocks):
+        tmp = tmp.replace(f"__STRONG_BLOCK_{i}__", block)
 
     return tmp
 
@@ -169,7 +191,8 @@ def wrap_circle_numbers_clean(text: str, strong_brackets: bool = True) -> str:
     t = re.sub(rf"\(([{CIRCLED_CHAR_CLASS}])\)", r"__CIRCLED__(\1)__", t)
 
     # 4) 남아있는 원문자 자체를 괄호로 감싸기: ① -> (①)
-    t = re.sub(rf"([{CIRCLED_CHAR_CLASS}])", r"(\1)", t)
+    t = re.sub(rf"(?<!\()\s*([{CIRCLED_CHAR_CLASS}])\s*(?!\))", r"(\1)", t)
+
 
     # 5) 마스킹 복원
     t = t.replace("__CIRCLED__", "").replace("__", "")
@@ -716,6 +739,8 @@ def action_wrap_circle_numbers(text: str, params: dict) -> WorkResult:
 def action_format_with_labels(text: str, params: dict) -> WorkResult:
     lowercase = bool(params.get("lowercase", False))
     out = format_with_labels(text, lowercase=lowercase)
+    # 라벨 사이 간격을 항상 4칸으로 강제
+    out = re.sub(r"\)\s*\(", ")    (", out)
 
     return WorkResult(
         ok=True,
@@ -850,13 +875,11 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
                 key="en_work_blank_reset",
             )
 
-        # (1) 원기호/원문자 -> strong 옵션
-        if "원기호" in action_key or "원문자" in action_key:
-            params["strong_brackets"] = st.checkbox(
-                "[...]를 <strong>로 감싸기",
-                value=True,
-                key="en_work_strong_brackets",
-            )
+        params["strong_brackets"] = st.checkbox(
+            "[...]를 <strong>로 감싸기 (모든 기능에 적용)",
+            value=True,
+            key="en_work_strong_brackets",
+        )
 
         # -------------------------
         # 미리보기
@@ -917,6 +940,7 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
         # -------------------------
         # 결과 표시 + 편집
         # -------------------------
+        
         result: Optional[WorkResult] = st.session_state.get("en_work_result")
         if not result:
             st.info("위에서 기능을 선택하고 ‘실행’을 누르면 결과가 나옵니다.")
@@ -926,18 +950,19 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
             st.error(result.error)
             return
 
-        st.markdown("### ✅ 실행 결과")
-        st.caption(result.title)
+        st.markdown("### 📌 최종본")
+        final_text = st.session_state.get("en_work_edit", result.output_text) or ""
 
-        # diff 하이라이트 (실행 결과 기준)
-        html_in2, html_out2 = highlight_diff_html(src_text, result.output_text)
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            st.markdown("**입력(변경점 표시)**")
-            st.markdown(wrap_pre_block(html_in2), unsafe_allow_html=True)
-        with cc2:
-            st.markdown("**실행 출력(변경점 표시)**")
-            st.markdown(wrap_pre_block(html_out2), unsafe_allow_html=True)
+        st.markdown("### 📌 최종본 (강조/밑줄 렌더링)")
+        st.markdown(
+            "<div style='background:#f7f7f7; border:1px solid #e5e5e5; "
+            "border-radius:8px; padding:12px; line-height:1.8; "
+            "font-weight:400; white-space: pre-wrap;'>"
+            "<style> strong{font-weight:800;} u{text-decoration-thickness:2px;} </style>"
+            f"{render_strong_html(final_text)}"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
         st.markdown("### ✍️ 결과 편집")
         edited = st.text_area(
@@ -965,19 +990,18 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
         with ccopy:
             st.caption("※ Streamlit은 ‘클립보드 복사’ 버튼이 기본 제공되지 않아, 텍스트를 드래그해서 복사하면 됩니다.")
 
-        st.markdown("### 📌 최종본")
-        final_text = st.session_state.get("en_work_edit", edited) or ""
+        st.markdown("### ✅ 실행 결과")
+        st.caption(result.title)
 
-        st.markdown("### 📌 최종본 (강조/밑줄 렌더링)")
-        st.markdown(
-            "<div style='background:#f7f7f7; border:1px solid #e5e5e5; "
-            "border-radius:8px; padding:12px; line-height:1.8; "
-            "font-weight:400;'>"
-            "<style> strong{font-weight:800;} u{text-decoration-thickness:2px;} </style>"
-            f"{render_strong_html(final_text)}"
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        # diff 하이라이트 (실행 결과 기준)
+        html_in2, html_out2 = highlight_diff_html(src_text, result.output_text)
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.markdown("**입력(변경점 표시)**")
+            st.markdown(wrap_pre_block(html_in2), unsafe_allow_html=True)
+        with cc2:
+            st.markdown("**실행 출력(변경점 표시)**")
+            st.markdown(wrap_pre_block(html_out2), unsafe_allow_html=True)
 
 
 
