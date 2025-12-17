@@ -953,7 +953,7 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
         st.markdown("### 📌 최종본")
         final_text = st.session_state.get("en_work_edit", result.output_text) or ""
 
-        st.markdown("### 📌 최종본 (강조/밑줄 렌더링)")
+        st.markdown("### 📌 최종본 (강조 렌더링)")
         st.markdown(
             "<div style='background:#f7f7f7; border:1px solid #e5e5e5; "
             "border-radius:8px; padding:12px; line-height:1.8; "

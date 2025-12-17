@@ -419,6 +419,63 @@ def tighten_between_answer_blocks(text: str) -> str:
     return text
 
 
+def normalize_explanation_headers(text: str) -> str:
+    if not text:
+        return text
+
+    header_patterns = [
+        (r"\[\s*정답\s*해설\s*\]", "[정답 해설]"),
+        (r"\[\s*오답\s*해설\s*\]", "[오답 해설]"),
+        (r"\[\s*적절하지\s*않은\s*이유\s*\]", "[적절하지 않은 이유]"),
+        (r"\[\s*적절한\s*이유\s*\]", "[적절한 이유]"),
+        (r"\[\s*출제\s*의도\s*\]", "[출제 의도]"),
+        (r"\[\s*중세의도\s*\]", "[중세의도]"),
+    ]
+
+    for pat, header in header_patterns:
+        text = re.sub(pat, header, text)
+        text = re.sub(rf"{re.escape(header)}\s*(?=\S)", f"{header}\n", text)
+
+    return text
+
+
+def ensure_wrong_explanation_linebreaks(text: str) -> str:
+    if not text:
+        return text
+
+    headers = {
+        "[정답 해설]",
+        "[오답 해설]",
+        "[적절하지 않은 이유]",
+        "[적절한 이유]",
+        "[출제 의도]",
+        "[중세의도]",
+    }
+    wrong_header = "[오답 해설]"
+
+    lines = text.splitlines()
+    out: List[str] = []
+    in_wrong_block = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped in headers:
+            in_wrong_block = (stripped == wrong_header)
+            out.append(stripped)
+            continue
+
+        if in_wrong_block and stripped:
+            # [오답 해설] 내부에서 원문자 목록이 한 줄에 붙는 경우 줄바꿈 보장
+            fixed = re.sub(r"(?<!^)\s*([①-⑳㉠-㉿])", r"\n\1", line)
+            parts = fixed.split("\n")
+            for part in parts:
+                out.append(part.strip() if part.strip() else "")
+        else:
+            out.append(line)
+
+    return "\n".join(out)
+
+
 def restore_pdf_text(raw_text: str) -> str:
     """
     ✅ (정산 적용) PDF 정리도 gemini_generate로 호출
@@ -451,11 +508,15 @@ def restore_pdf_text(raw_text: str) -> str:
     if m:
         inner = m.group(1)
         inner = normalize_inline_answer_marker(inner)
+        inner = normalize_explanation_headers(inner)
+        inner = ensure_wrong_explanation_linebreaks(inner)
         inner = tighten_between_answer_blocks(inner)
         stripped = f"```text\n{inner}\n```"
     else:
-        inner = tighten_between_answer_blocks(stripped)
-        inner = normalize_inline_answer_marker(inner)
+        inner = normalize_inline_answer_marker(stripped)
+        inner = normalize_explanation_headers(inner)
+        inner = ensure_wrong_explanation_linebreaks(inner)
+        inner = tighten_between_answer_blocks(inner)
         stripped = f"```text\n{inner}\n```"
 
     return stripped
