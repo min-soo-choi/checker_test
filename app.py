@@ -9,6 +9,9 @@ from typing import Dict, Any, List
 from datetime import datetime, timezone
 import uuid
 import traceback
+from features.ko_work import render_ko_work_tab
+from features.en_work import render_en_work_tab
+
 
 import streamlit as st
 import google.generativeai as genai
@@ -1560,9 +1563,22 @@ st.set_page_config(page_title="AI 검수기 (Gemini)", page_icon="📚", layout=
 st.title("📚 Delta 작업자 Test (Gemini 기반)")
 st.caption("한국어/영어 단일 텍스트 + 해설 양식 변환 (오탈자/형식 위주, 스타일 제안 금지).")
 
-tab_ko, tab_en, tab_pdf, tab_about, tab_debug = st.tabs(
-    ["✏️ 한국어 검수", "✏️ 영어 검수", "📄 해설 텍스트 정리", "ℹ️ 설명", "🐞 디버그"]
+tab_ko, tab_en, tab_ko_work, tab_en_work, tab_pdf, tab_about, tab_debug = st.tabs(
+    ["✏️ 한국어 검수", "✏️ 영어 검수", "🧰 국어 작업", "🧰 영어 작업", "📄 해설 텍스트 정리", "ℹ️ 설명", "🐞 디버그"]
 )
+
+render_ko_work_tab(
+    tab_ko_work,
+    st,
+    review_korean_text=review_korean_text,
+)
+
+render_en_work_tab(
+    tab_en_work,
+    st,
+    review_english_text=review_english_text,
+)
+
 
 # --- 한국어 검수 탭 ---
 with tab_ko:
