@@ -186,7 +186,24 @@ def _log_event(feature: str, status: str, latency_ms: int, usage: dict, cost_usd
         float(cost_usd or 0.0),
         (error or "")[:500],
     ]
-    ws.append_row(values, value_input_option="RAW")
+    # 헤더(1행) 아래에서 첫 빈 행을 찾아 기록하고, 없으면 새 행을 추가한다.
+    try:
+        all_values = ws.get_all_values()
+        target_row = None
+        for idx in range(1, len(all_values)):
+            row = all_values[idx]
+            first_cell = row[0] if row else ""
+            if not str(first_cell).strip():
+                target_row = idx + 1  # 1-based row index
+                break
+
+        if target_row is None:
+            target_row = len(all_values) + 1
+
+        ws.update(f"A{target_row}", [values], value_input_option="RAW")
+    except Exception:
+        # 실패 시에는 기존 방식으로라도 기록
+        ws.append_row(values, value_input_option="RAW")
 
 
 def gemini_generate(feature: str, prompt: str, generation_config: dict):
