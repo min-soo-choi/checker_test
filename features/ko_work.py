@@ -120,11 +120,15 @@ def _get_gspread_client() -> gspread.client.Client:
     if secrets_key in st.secrets:
         try:
             return gspread.service_account_from_dict(dict(st.secrets[secrets_key]))
-        except Exception:
-            pass  # fallback below
+        except Exception as e:
+            raise RuntimeError("secrets['gcp_service_account'] 로드에 실패했습니다. 서비스 계정 JSON을 확인해주세요.") from e
 
     if not SERVICE_ACCOUNT_FILE.exists():
-        raise FileNotFoundError(f"서비스 계정 키 파일이 없습니다: {SERVICE_ACCOUNT_FILE}")
+        raise RuntimeError(
+            "Google 시트 자격증명이 없습니다. "
+            "st.secrets['gcp_service_account']에 서비스 계정 JSON을 넣거나 "
+            f"프로젝트 루트에 {SERVICE_ACCOUNT_FILE.name} 파일을 배치해 주세요."
+        )
     return gspread.service_account(filename=str(SERVICE_ACCOUNT_FILE))
 
 
