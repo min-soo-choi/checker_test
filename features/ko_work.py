@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import html
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,6 +123,14 @@ def _get_gspread_client() -> gspread.client.Client:
             return gspread.service_account_from_dict(dict(st.secrets[secrets_key]))
         except Exception as e:
             raise RuntimeError("secrets['gcp_service_account'] 로드에 실패했습니다. 서비스 계정 JSON을 확인해주세요.") from e
+    # Streamlit Cloud 환경 변수를 통해 전달된 경우도 지원
+    env_key = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    if env_key:
+        try:
+            import json
+            return gspread.service_account_from_dict(json.loads(env_key))
+        except Exception as e:
+            raise RuntimeError("환경변수 GCP_SERVICE_ACCOUNT_JSON 로드에 실패했습니다. 서비스 계정 JSON 문자열을 확인해주세요.") from e
 
     if not SERVICE_ACCOUNT_FILE.exists():
         raise RuntimeError(
@@ -137,7 +146,7 @@ def _get_sheet_id() -> str:
     secrets에 sheet_id가 있으면 사용, 없으면 기본값 사용.
     기본값도 없으면 오류.
     """
-    sid = st.secrets.get("sheet_id") if "sheet_id" in st.secrets else SHEET_ID_DEFAULT
+    sid = st.secrets.get("sheet_id") if "sheet_id" in st.secrets else os.environ.get("SHEET_ID") or SHEET_ID_DEFAULT
     if not sid:
         raise RuntimeError("sheet_id가 설정되어 있지 않습니다. secrets.toml에 sheet_id를 추가해 주세요.")
     return sid
