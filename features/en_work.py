@@ -126,6 +126,64 @@ def render_strong_html(text: str) -> str:
     return tmp
 
 
+def render_strong_and_underline_html(text: str) -> str:
+    """
+    <strong>과 밑줄 span을 안전하게 렌더링.
+    - 스타일이 underline을 포함하는 span/u는 <u>로 변환
+    - 그 외 span은 태그 제거(내용만)
+    - 나머지는 escape
+    """
+    if not text:
+        return ""
+
+    strong_blocks: list[str] = []
+    span_blocks: list[tuple[str, bool]] = []  # (content, is_underline)
+
+    def _stash_span(m: re.Match) -> str:
+        attrs = m.group(1) or ""
+        inner = m.group(2) or ""
+        is_under = bool(re.search(r"underline", attrs, flags=re.IGNORECASE))
+        span_blocks.append((inner, is_under))
+        return f"__SPAN_BLOCK_{len(span_blocks)-1}__"
+
+    def _stash_u(m: re.Match) -> str:
+        inner = m.group(1) or ""
+        span_blocks.append((inner, True))
+        return f"__SPAN_BLOCK_{len(span_blocks)-1}__"
+
+    def _stash_strong(m: re.Match) -> str:
+        strong_blocks.append(m.group(1))
+        return f"__STRONG_BLOCK_{len(strong_blocks)-1}__"
+
+    tmp = text
+    # underline 태그 먼저
+    tmp = re.sub(r"<u>(.*?)</u>", _stash_u, tmp, flags=re.DOTALL | re.IGNORECASE)
+    # span을 먼저 스태시 (underline 여부 기록)
+    tmp = re.sub(r"<span(.*?)>(.*?)</span>", _stash_span, tmp, flags=re.DOTALL | re.IGNORECASE)
+    # strong 스태시
+    tmp = re.sub(r"<strong>(.*?)</strong>", _stash_strong, tmp, flags=re.DOTALL | re.IGNORECASE)
+
+    tmp = html.escape(tmp)
+
+    for i, content in enumerate(strong_blocks):
+        safe_inner = html.escape(content)
+        tmp = tmp.replace(
+            html.escape(f"__STRONG_BLOCK_{i}__"),
+            f"<strong>{safe_inner}</strong>",
+        )
+
+    for i, (content, is_under) in enumerate(span_blocks):
+        safe_inner = html.escape(content)
+        replacement = f"<u>{safe_inner}</u>" if is_under else safe_inner
+        tmp = tmp.replace(
+            html.escape(f"__SPAN_BLOCK_{i}__"),
+            replacement,
+        )
+
+    tmp = tmp.replace("\n", "<br>")
+    return tmp
+
+
 def apply_strong_brackets(text: str) -> str:
     if not text:
         return text
@@ -187,15 +245,16 @@ def wrap_circle_numbers_clean(text: str, strong_brackets: bool = True) -> str:
     t = re.sub(r"\(\s*([0-9]{1,2})\s*\)", _num_to_circled, t)
 
     # 3) 이미 (①) 형태인 것 마스킹 (중복 괄호 방지)
-    #    (①) -> __CIRCLED__(①)__ 형태
-    t = re.sub(rf"\(([{CIRCLED_CHAR_CLASS}])\)", r"__CIRCLED__(\1)__", t)
+    #    (①) -> §CIRCLED§(①)§ 형태
+    placeholder = "§CIRCLED§"
+    t = re.sub(rf"\(([{CIRCLED_CHAR_CLASS}])\)", rf"{placeholder}(\1){placeholder}", t)
 
     # 4) 남아있는 원문자 자체를 괄호로 감싸기: ① -> (①)
     t = re.sub(rf"(?<!\()\s*([{CIRCLED_CHAR_CLASS}])\s*(?!\))", r"(\1)", t)
 
 
-    # 5) 마스킹 복원
-    t = t.replace("__CIRCLED__", "").replace("__", "")
+    # 5) 마스킹 복원 (일반 텍스트의 밑줄/언더스코어는 건드리지 않도록 고유 토큰 사용)
+    t = t.replace(placeholder, "")
 
     # 6) 괄호 앞뒤 공백 하나로 정리
     #    " ( ① ) " 같은 걸 " (①) " 느낌으로
@@ -463,6 +522,101 @@ def convert_commas_in_brackets(text: str) -> str:
     result = re.sub(r"\s{2,}", " ", result).strip()
     return result
 
+
+def convert_commas_in_brackets_with_underline(
+    text: str,
+    *,
+    add_labels: bool = False,
+    use_lowercase: bool = False,
+) -> str:
+    """
+    괄호 내부 단어 배열 정규화 + 대괄호 구간 밑줄 처리.
+    - ()에서 쉼표 2개 이상이면 []로 바꾸고 ' / '로 연결 후 밑줄
+    - [] 내부는 쉼표/슬래시 혼용을 ' / '로 정규화 후 밑줄
+    - 괄호 앞뒤 스페이스는 1칸으로 정리(줄바꿈/문장 시작 제외)
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+
+    # 따옴표 정리
+    t = re.sub(r"[“”]", '"', text)
+    t = re.sub(r"[‘’]", "'", t)
+
+    # 불필요한 스타일(span) 제거: underline만 보존
+    def _normalize_span(m: re.Match) -> str:
+        attrs = m.group(1) or ""
+        inner = m.group(2) or ""
+        is_under = bool(re.search(r"underline", attrs, flags=re.IGNORECASE))
+        return f"<u>{inner}</u>" if is_under else inner
+
+    t = re.sub(r"<span(.*?)>(.*?)</span>", _normalize_span, t, flags=re.DOTALL | re.IGNORECASE)
+
+    bracket_re = re.compile(r"(\(|\[)([^()\[\]]+?)(\)|\])")
+
+    out: list[str] = []
+    last_index = 0
+    label_index = 0
+    labels = LABELS_LOWER if use_lowercase else LABELS_UPPER
+
+    for m in bracket_re.finditer(t):
+        open_b, inner, close_b = m.group(1), m.group(2), m.group(3)
+
+        # 매치 이전 구간 복사(바깥 쉼표 변환 없음)
+        out.append(t[last_index:m.start()])
+
+        is_square = (open_b == "[" and close_b == "]")
+        comma_count = inner.count(",")
+
+        normalized_inner = None
+        if open_b == "(" and close_b == ")" and comma_count >= 2:
+            tokens = [s.strip() for s in inner.split(",") if s.strip()]
+            normalized_inner = " / ".join(tokens)
+            is_square = True
+        elif is_square:
+            tokens = [s.strip() for s in re.split(r"[/,]", inner) if s.strip()]
+            if len(tokens) >= 2:
+                normalized_inner = " / ".join(tokens)
+            else:
+                normalized_inner = re.sub(r"\s+", " ", inner).strip()
+
+        if is_square:
+            # 앞 공백 정리: 연속 공백 제거 후, 줄바꿈/시작이 아니면 1칸
+            current = "".join(out)
+            while current.endswith(" "):
+                current = current[:-1]
+            out = [current]
+            if current and not current.endswith("\n"):
+                out.append(" ")
+
+            emit = f'[ <span style="text-decoration: underline;">{normalized_inner}</span> ]'
+
+            label_prefix = ""
+            if add_labels:
+                label_char = labels[label_index % len(labels)]
+                label_prefix = f"({label_char}) "
+                label_index += 1
+
+            out.append(label_prefix + emit)
+
+            # 뒤 공백 정리: 원문의 연속 스페이스를 소비하고, 줄바꿈/끝 아니면 1칸
+            next_idx = m.end()
+            while next_idx < len(t) and t[next_idx] == " ":
+                next_idx += 1
+            next_ch = t[next_idx] if next_idx < len(t) else ""
+            if next_ch and next_ch != "\n":
+                out.append(" ")
+
+            last_index = next_idx
+        else:
+            out.append(m.group(0))
+            last_index = m.end()
+
+    out.append(t[last_index:])
+
+    result = "".join(out)
+    result = re.sub(r"\s{2,}", " ", result).strip()
+    return result
+
 def _normalize_plain_segment(seg: str) -> str:
     """
     괄호 밖 일반 구간:
@@ -577,7 +731,7 @@ def _base_code(use_lowercase: bool) -> int:
 def _label_char(idx: int, use_lowercase: bool) -> str:
     return chr(_base_code(use_lowercase) + (idx % 26))
 
-def label_blanks_v2(text: str, *, use_lowercase: bool = False, reset_labels: bool = False) -> str:
+def label_blanks_v2(text: str, *, use_lowercase: bool = False) -> str:
     """
     Port of labelBlanksV2Upper + lowercase option.
     - Adds (A)/(a) labels before blanks, normalizes blanks to TEN underscores.
@@ -596,12 +750,6 @@ def label_blanks_v2(text: str, *, use_lowercase: bool = False, reset_labels: boo
     t = re.sub(r"[“”]", '"', t)
     t = re.sub(r"[‘’]", "'", t)
     t = re.sub(r"[\u00A0\u2007\u202F]", " ", t)
-
-    # NEW: reset existing labels option
-    if reset_labels:
-        t = re.sub(r"\s*\([A-Za-z]\)\s*", " ", t)
-        t = re.sub(r"\s{2,}", " ", t).strip()
-        t = t.replace(MARK_L, "").replace(MARK_R, "")
 
     # helper regex depending on case
     label_re = r"\([a-z]\)" if use_lowercase else r"\([A-Z]\)"
@@ -787,19 +935,39 @@ def action_replace_commas_with_slashes(text: str, params: dict) -> WorkResult:
 @register_action("6. 밑줄 앞 기호 붙이기 (A/a 선택)")
 def action_label_blanks(text: str, params: dict) -> WorkResult:
     use_lowercase = bool(params.get("use_lowercase", False))
-    reset_labels = bool(params.get("reset_labels", False))
 
     out = label_blanks_v2(
         text,
         use_lowercase=use_lowercase,
-        reset_labels=reset_labels,
     )
 
     return WorkResult(
         ok=True,
         title="밑줄 라벨링 결과",
         output_text=out,
-        data={"use_lowercase": use_lowercase, "reset_labels": reset_labels},
+        data={"use_lowercase": use_lowercase},
+    )
+
+@register_action("7. 본문 단어배열 서식적용 및 밑줄")
+def action_convert_commas_in_brackets_with_underline(text: str, params: dict) -> WorkResult:
+    add_labels = bool(params.get("label_brackets", True))
+    use_lowercase = bool(params.get("label_lowercase", False))
+
+    out = convert_commas_in_brackets_with_underline(
+        text,
+        add_labels=add_labels,
+        use_lowercase=use_lowercase,
+    )
+    return WorkResult(
+        ok=True,
+        title="본문 단어배열 서식 및 밑줄 적용 결과",
+        output_text=out,
+        data={
+            "rule": "(),[] shallow only; (,)>=2 -> [] with underline; [] normalize separators and underline contents",
+            "allow_underline_html": True,
+            "labels_added": add_labels,
+            "labels_case": "lowercase" if use_lowercase else "uppercase",
+        },
     )
 
 def render_en_work_tab(tab, st, *, review_english_text=None):
@@ -861,7 +1029,7 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
             params["use_lowercase"] = label_case2.startswith("소문자")
 
         # (6) 밑줄 라벨
-        if "밑줄" in action_key or "blank" in action_key.lower():
+        if ("밑줄" in action_key or "blank" in action_key.lower()) and action_key != "7. 본문 단어배열 서식적용 및 밑줄":
             label_case3 = st.radio(
                 "라벨 형태",
                 ["대문자 (A, B, C)", "소문자 (a, b, c)"],
@@ -869,17 +1037,23 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
                 key="en_work_blank_label_case",
             )
             params["use_lowercase"] = label_case3.startswith("소문자")
-            params["reset_labels"] = st.checkbox(
-                "기존 (A)/(a) 라벨 제거 후 다시 부여",
-                value=False,
-                key="en_work_blank_reset",
-            )
 
         params["strong_brackets"] = st.checkbox(
             "[...]를 <strong>로 감싸기 (모든 기능에 적용)",
             value=True,
             key="en_work_strong_brackets",
         )
+
+        # (7) 본문 단어배열 서식+밑줄: 라벨 옵션 (3번과 동일 UX)
+        if action_key == "7. 본문 단어배열 서식적용 및 밑줄":
+            label_case_7 = st.radio(
+                "[] 라벨 형태",
+                ["대문자 (A, B, C)", "소문자 (a, b, c)"],
+                horizontal=True,
+                key="en_work_7_label_case",
+            )
+            params["label_brackets"] = True
+            params["label_lowercase"] = label_case_7.startswith("소문자")
 
         # -------------------------
         # 미리보기
@@ -919,6 +1093,8 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
             st.session_state.pop("en_work_result", None)
             st.session_state.pop("en_work_edit", None)
             st.session_state.pop("en_work_error", None)
+            st.session_state.pop("en_work_edit_area", None)
+            st.session_state.pop("en_work_result_text", None)
             st.rerun()
 
         if run:
@@ -934,6 +1110,9 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
                 if result.ok:
                     # 편집 가능한 버퍼 생성
                     st.session_state["en_work_edit"] = result.output_text
+                    # 기존 위젯 상태 초기화 후 새 값으로 시작하도록 키 제거
+                    st.session_state.pop("en_work_edit_area", None)
+                    st.session_state["en_work_result_text"] = result.output_text
                 else:
                     st.session_state["en_work_error"] = result.error
 
@@ -950,21 +1129,38 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
             st.error(result.error)
             return
 
-        st.markdown("### 📌 최종본")
-        final_text = st.session_state.get("en_work_edit", result.output_text) or ""
+        # 새 실행 결과가 이전과 다르면 편집 버퍼를 최신 실행 결과로 동기화
+        last_result_text = st.session_state.get("en_work_result_text")
+        if result.output_text != last_result_text:
+            st.session_state["en_work_edit"] = result.output_text
+            st.session_state["en_work_result_text"] = result.output_text
+            st.session_state.pop("en_work_edit_area", None)
 
-        st.markdown("### 📌 최종본 (강조 렌더링)")
-        st.markdown(
-            "<div style='background:#f7f7f7; border:1px solid #e5e5e5; "
-            "border-radius:8px; padding:12px; line-height:1.8; "
-            "font-weight:400; white-space: pre-wrap;'>"
-            "<style> strong{font-weight:800;} u{text-decoration-thickness:2px;} </style>"
-            f"{render_strong_html(final_text)}"
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        action_current = st.session_state.get("en_work_action", action_key)
+        show_final_render = action_current != "7. 본문 단어배열 서식적용 및 밑줄"
+
+        if show_final_render:
+            st.markdown("### 📌 최종본")
+            final_text = st.session_state.get("en_work_edit", result.output_text) or ""
+
+            st.markdown("### 📌 최종본 (강조 렌더링)")
+            # 최종본: 강조(strong)만 렌더, 밑줄 태그는 그대로 표시
+            render_fn = render_strong_html
+            st.markdown(
+                "<div style='background:#f7f7f7; border:1px solid #e5e5e5; "
+                "border-radius:8px; padding:12px; line-height:1.8; "
+                "font-weight:400; white-space: pre-wrap;'>"
+                "<style> strong{font-weight:800;} u{text-decoration-thickness:2px;} </style>"
+                f"{render_fn(final_text)}"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
         st.markdown("### ✍️ 결과 편집")
+        # 위젯 초기값 동기화: 새로운 실행 결과가 있으면 widget state를 초기화
+        if "en_work_edit_area" not in st.session_state:
+            st.session_state["en_work_edit_area"] = st.session_state.get("en_work_edit", result.output_text)
+
         edited = st.text_area(
             "아래 텍스트를 직접 수정할 수 있어요 (이 값이 최종본이 됩니다).",
             height=220,

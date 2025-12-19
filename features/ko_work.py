@@ -4,7 +4,11 @@
 import html
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+import gspread
+import streamlit as st
 
 
 # =========================
@@ -96,6 +100,54 @@ def run_action(action_key: str, text: str, params: Dict[str, Any]) -> WorkResult
         return fn(text, params)
     except Exception as e:
         return WorkResult(ok=False, title="실행 실패", error=str(e))
+
+
+# =========================
+# Google Sheet helpers
+# =========================
+
+SHEET_ID_DEFAULT: Optional[str] = None  # secrets.toml의 sheet_id 사용
+SHEET_TABS = ["KOR_paragraph_db의_모의고사", "KOR_paragraph_db의_교과서"]
+SERVICE_ACCOUNT_FILE = Path(__file__).resolve().parent.parent / "expertupdate-ec3c7ee5b4d6.json"
+
+
+def _get_gspread_client() -> gspread.client.Client:
+    """
+    1) st.secrets["gcp_service_account"]에 JSON( dict )이 있을 경우 우선 사용
+    2) 아니면 로컬 서비스 계정 파일 경로 사용
+    """
+    secrets_key = "gcp_service_account"
+    if secrets_key in st.secrets:
+        try:
+            return gspread.service_account_from_dict(dict(st.secrets[secrets_key]))
+        except Exception:
+            pass  # fallback below
+
+    if not SERVICE_ACCOUNT_FILE.exists():
+        raise FileNotFoundError(f"서비스 계정 키 파일이 없습니다: {SERVICE_ACCOUNT_FILE}")
+    return gspread.service_account(filename=str(SERVICE_ACCOUNT_FILE))
+
+
+def _get_sheet_id() -> str:
+    """
+    secrets에 sheet_id가 있으면 사용, 없으면 기본값 사용.
+    기본값도 없으면 오류.
+    """
+    sid = st.secrets.get("sheet_id") if "sheet_id" in st.secrets else SHEET_ID_DEFAULT
+    if not sid:
+        raise RuntimeError("sheet_id가 설정되어 있지 않습니다. secrets.toml에 sheet_id를 추가해 주세요.")
+    return sid
+
+
+@st.cache_data(show_spinner=False)
+def load_sheet_rows(tab_name: str) -> List[Dict[str, Any]]:
+    """
+    시트 한 탭의 모든 행을 로드합니다.
+    """
+    client = _get_gspread_client()
+    sh = client.open_by_key(_get_sheet_id())
+    ws = sh.worksheet(tab_name)
+    return ws.get_all_records()
 
 
 # =========================
@@ -282,6 +334,129 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
         if pending_input is not None:
             st.session_state["ko_work_input"] = pending_input
 
+        with st.expander("📄 시트에서 불러오기", expanded=False):
+            st.caption("시트에서 작가명/작품명/지문 텍스트로 검색해 OCR 입력에 넣을 수 있어요.")
+            sheet_tab = st.selectbox(
+                "탭 선택",
+                SHEET_TABS,
+                key="ko_sheet_tab",
+            )
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                q_author = st.text_input("작가명 포함", key="ko_sheet_q_author")
+            with c2:
+                q_title = st.text_input("작품명 포함", key="ko_sheet_q_title")
+            with c3:
+                q_text = st.text_input("지문 텍스트 포함", key="ko_sheet_q_text")
+
+            search = st.button("시트 조회", key="ko_sheet_search")
+            if search:
+                try:
+                    rows = load_sheet_rows(sheet_tab)
+                    q_author_l = q_author.strip().lower()
+                    q_title_l = q_title.strip().lower()
+                    q_text_l = q_text.strip().lower()
+
+                    def _match(row: Dict[str, Any]) -> bool:
+                        a = str(row.get("작가명", "")).lower()
+                        t = str(row.get("작품명", "")).lower()
+                        txt = str(row.get("지문 텍스트", "")).lower()
+                        if q_author_l and q_author_l not in a:
+                            return False
+                        if q_title_l and q_title_l not in t:
+                            return False
+                        if q_text_l and q_text_l not in txt:
+                            return False
+                        return True
+
+                    filtered = [r for r in rows if _match(r)]
+                    st.session_state["ko_sheet_results"] = filtered
+                    st.session_state["ko_sheet_selected_tab"] = sheet_tab
+                    st.success(f"검색 완료: {len(filtered)}건")
+                except Exception as e:
+                    st.session_state["ko_sheet_results"] = []
+                    st.warning(f"시트 조회 실패: {e}")
+
+            results = st.session_state.get("ko_sheet_results", [])
+            if results:
+                def _hilite(text: str, needle: str) -> str:
+                    if not needle.strip():
+                        return html.escape(text)
+                    pat = re.compile(re.escape(needle.strip()), flags=re.IGNORECASE)
+                    return pat.sub(lambda m: f"<mark>{html.escape(m.group(0))}</mark>", html.escape(text))
+
+                options = []
+                for idx, row in enumerate(results):
+                    title = str(row.get("작품명", "")).strip()
+                    author = str(row.get("작가명", "")).strip()
+                    snippet = str(row.get("지문 텍스트", "")).strip()[:60]
+                    display_plain = f"{title} / {author} — {snippet}..."
+                    display_html = (
+                        f"{_hilite(title, q_title)} / "
+                        f"{_hilite(author, q_author)} — "
+                        f"{_hilite(snippet, q_text)}..."
+                    )
+                    options.append({"idx": idx, "plain": display_plain, "html": display_html})
+
+                st.markdown(
+                    """
+                    <style>
+                    div[role="radiogroup"] > label {
+                        display: block;
+                        background: #f8f9fb;
+                        border: 1px solid #e3e6ec;
+                        border-radius: 8px;
+                        padding: 8px 10px;
+                        margin-bottom: 6px;
+                        transition: background 0.2s, border 0.2s;
+                    }
+                    div[role="radiogroup"] > label:hover {
+                        background: #eef2f7;
+                        border-color: #d4dae5;
+                    }
+                    div[role="radiogroup"] mark {
+                        background: #fff3a3;
+                        padding: 0 2px;
+                        border-radius: 3px;
+                    }
+                    </style>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown(
+                    """
+                    <style>
+                    div[role="radiogroup"] > label {
+                        display: block;
+                        background: #f8f9fb;
+                        border: 1px solid #e3e6ec;
+                        border-radius: 8px;
+                        padding: 8px 10px;
+                        margin-bottom: 6px;
+                        transition: background 0.2s, border 0.2s;
+                    }
+                    div[role="radiogroup"] > label:hover {
+                        background: #eef2f7;
+                        border-color: #d4dae5;
+                    }
+                    </style>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                sel_idx = st.radio(
+                    "검색 결과 선택",
+                    options=[opt["idx"] for opt in options],
+                    format_func=lambda x: {o["idx"]: o["plain"] for o in options}[x],
+                    key="ko_sheet_selected_idx",
+                )
+                if st.button("이 지문을 입력에 불러오기", key="ko_sheet_apply"):
+                    chosen = results[sel_idx]
+                    st.session_state["ko_work_apply_input_value"] = str(chosen.get("지문 텍스트", "")).strip()
+                    st.success("OCR 입력에 반영했어요. 잠시 후 갱신됩니다.")
+                    st.rerun()
+
         text = st.text_area("OCR 텍스트 입력", height=260, key="ko_work_input")
 
         # 기능 선택 (시트 검색 작품 들여쓰기를 최우선으로 표시)
@@ -417,6 +592,8 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
             st.session_state.pop("ko_work_output_raw", None)
             st.session_state.pop("ko_work_output_edited", None)
             st.session_state.pop("ko_work_output_final", None)
+            st.session_state.pop("ko_work_output_editor", None)
+            st.session_state.pop("ko_work_last_result_text", None)
             st.rerun()
 
         if run:
@@ -435,9 +612,12 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
                     st.session_state["ko_work_result"] = result
 
                     if result and result.ok:
+                        st.session_state["ko_work_should_sync_editor"] = True
                         st.session_state["ko_work_output_raw"] = result.output_text
                         st.session_state["ko_work_output_edited"] = result.output_text
                         st.session_state["ko_work_output_final"] = result.output_text
+                        st.session_state.pop("ko_work_output_editor", None)
+                        st.session_state["ko_work_last_result_text"] = result.output_text
 
         # 결과 표시
         result: Optional[WorkResult] = st.session_state.get("ko_work_result")
@@ -449,6 +629,14 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
             st.error(result.error)
             return
 
+        # 실행 버튼을 막 누른 경우: 편집 영역을 최신 결과로 강제 동기화
+        if st.session_state.pop("ko_work_should_sync_editor", False):
+            st.session_state["ko_work_output_edited"] = result.output_text
+            st.session_state["ko_work_output_final"] = result.output_text
+            st.session_state["ko_work_output_raw"] = result.output_text
+            st.session_state["ko_work_output_editor"] = result.output_text
+            st.session_state["ko_work_last_result_text"] = result.output_text
+
         st.markdown(f"### ✅ {result.title}")
 
         # 최종본(복사용) - 저장된 값이 없으면 최신 편집본/자동 결과를 사용
@@ -459,7 +647,7 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
 
         edited = st.text_area(
             "결과 텍스트 (수정 가능)",
-            value=edited_default,
+            value=st.session_state.get("ko_work_output_editor", edited_default),
             height=260,
             key="ko_work_output_editor",
         )
