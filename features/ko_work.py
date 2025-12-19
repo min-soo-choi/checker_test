@@ -649,7 +649,6 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
             st.session_state["ko_work_output_edited"] = result.output_text
             st.session_state["ko_work_output_final"] = result.output_text
             st.session_state["ko_work_output_raw"] = result.output_text
-            st.session_state["ko_work_output_editor"] = result.output_text
             st.session_state["ko_work_last_result_text"] = result.output_text
 
         st.markdown(f"### ✅ {result.title}")
@@ -658,77 +657,103 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
         edited_default = st.session_state.get("ko_work_output_edited", result.output_text)
         final_text = st.session_state.get("ko_work_output_final", edited_default)
         copy_payload = json.dumps(final_text)
-        st.markdown(
+        # 최종본 텍스트 + 복사 버튼을 components로 표시
+        st.components.v1.html(
             f"""
-            <div style="display:flex; align-items:center; gap:8px; margin: 4px 0 6px 0;">
-                <div style="font-weight:600;">📌 최종 확정본(복사용)</div>
-                <button id="ko_final_copy_btn" style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
+            <div style="font-weight:600; margin:8px 0 4px 0;">📄 최종 확정본(복사용)</div>
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                <button id="ko_final_copy_btn" style="padding:6px 10px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
                     복사
                 </button>
             </div>
+            <pre style="white-space:pre-wrap; background:#f7f7f7; border:1px solid #e5e5e5; border-radius:8px; padding:12px; max-height:240px; overflow:auto;">{html.escape(final_text)}</pre>
             <script>
-const btn = document.getElementById("ko_final_copy_btn");
-if (btn) {{
-  btn.onclick = async () => {{
-    try {{
-      const hidden = document.getElementById("ko_final_copy_src");
-      const val = hidden ? hidden.value : {copy_payload};
-      await navigator.clipboard.writeText(val);
-      const old = btn.innerText;
-      btn.innerText = "복사 완료!";
-      setTimeout(()=>{{btn.innerText = old;}}, 1200);
-    }} catch(e) {{
-      btn.innerText = "복사 실패";
+            const btn = document.getElementById("ko_final_copy_btn");
+            const copyVal = async () => {{
+              const val = {copy_payload};
+              try {{
+                if (navigator.clipboard && navigator.clipboard.writeText) {{
+                  await navigator.clipboard.writeText(val);
+                }} else {{
+                  const ta = document.createElement('textarea');
+                  ta.value = val;
+                  document.body.appendChild(ta);
+                  ta.select();
+                  document.execCommand('copy');
+                  document.body.removeChild(ta);
                 }}
-              }};
+                if (btn) {{
+                  const old = btn.innerText;
+                  btn.innerText = "복사 완료!";
+                  setTimeout(()=>{{btn.innerText = old;}}, 1000);
+                }}
+              }} catch(e) {{
+                if (btn) btn.innerText = "복사 실패";
+              }}
+            }};
+            if (btn) {{
+              btn.onclick = () => copyVal();
             }}
             </script>
             """,
-            unsafe_allow_html=True,
+            height=260,
+            scrolling=True,
         )
-        st.code(final_text, language="text")
-        # 숨김 영역에 최신 텍스트를 넣어두고 copy 버튼이 여기서 읽도록 함
-        st.markdown(
-            f"<textarea id='ko_final_copy_src' style='position:absolute; left:-9999px;' aria-hidden='true'>{html.escape(final_text)}</textarea>",
-            unsafe_allow_html=True,
+
+        # 결과 텍스트 복사(components로 안정적 처리) - textarea 위에 배치
+        st.components.v1.html(
+            f"""
+            <div style="display:flex; align-items:center; gap:8px; margin: 12px 0 6px 0;">
+                <div style="font-weight:600; font-size:1.05rem;">✍️ 결과 텍스트 (수정 가능)</div>
+                <button id="ko_edit_copy_btn" type="button"
+                    style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
+                    복사
+                </button>
+                <span id="ko_edit_copy_msg" style="font-size:12px; color:#666;"></span>
+            </div>
+            <script>
+            const editBtn = document.getElementById("ko_edit_copy_btn");
+            const editMsg = document.getElementById("ko_edit_copy_msg");
+            // textarea 값은 JS에서 직접 읽기 (rerun 대응)
+            async function copyKoEdit() {{
+              try {{
+                const ta = Array.from(document.querySelectorAll('textarea[data-testid="stTextArea"]'))
+                  .find(el => el.getAttribute("aria-label") === "");
+                const val = ta ? (ta.value || "") : "";
+                if (navigator.clipboard && navigator.clipboard.writeText) {{
+                  await navigator.clipboard.writeText(val);
+                }} else {{
+                  const tmp = document.createElement('textarea');
+                  tmp.value = val;
+                  document.body.appendChild(tmp);
+                  tmp.select();
+                  document.execCommand('copy');
+                  document.body.removeChild(tmp);
+                }}
+                if (editMsg) {{
+                  editMsg.textContent = "복사 완료!";
+                  setTimeout(()=>{{editMsg.textContent = ""; }}, 1200);
+                }}
+              }} catch (e) {{
+                if (editMsg) editMsg.textContent = "복사 실패";
+                console.error(e);
+              }}
+            }}
+            if (editBtn) {{
+              editBtn.addEventListener("click", copyKoEdit);
+            }}
+            </script>
+            """,
+            height=60,
         )
 
         edited = st.text_area(
-            "결과 텍스트 (수정 가능)",
-            value=st.session_state.get("ko_work_output_editor", edited_default),
+            "",
+            value=st.session_state.get("ko_work_output_edited", edited_default),
             height=260,
             key="ko_work_output_editor",
         )
         st.session_state["ko_work_output_edited"] = edited
-        st.markdown(
-            f"""
-            <div style="display:flex; align-items:center; gap:8px; margin: 12px 0 4px 0;">
-                <div style="font-weight:600; font-size:1.05rem;">✍️ 결과 텍스트 (수정 가능)</div>
-                <button id="ko_edit_copy_btn" style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
-                    복사
-                </button>
-            </div>
-            <script>
-            const btnEditKo = document.getElementById("ko_edit_copy_btn");
-            if (btnEditKo) {{
-              btnEditKo.onclick = async () => {{
-                try {{
-                  const ta = Array.from(document.querySelectorAll('textarea[data-testid="stTextArea"]'))
-                    .find(el => el.getAttribute("aria-label") === "결과 텍스트 (수정 가능)");
-                  const val = ta ? ta.value : "";
-                  await navigator.clipboard.writeText(val);
-                  const old = btnEditKo.innerText;
-                  btnEditKo.innerText = "복사 완료!";
-                  setTimeout(()=>{{btnEditKo.innerText = old;}}, 1200);
-                }} catch(e) {{
-                  btnEditKo.innerText = "복사 실패";
-                }}
-              }};
-            }}
-            </script>
-            """,
-            unsafe_allow_html=True,
-        )
 
         c_save, c_reset_edit, c_use = st.columns(3)
 
@@ -747,6 +772,59 @@ if (btn) {{
                 st.session_state["ko_work_apply_input_value"] = final_text
                 st.success("OCR 입력을 최종본으로 교체했어. 필요하면 다시 실행해봐.")
                 st.rerun()
+
+        # 모든 textarea에 복사 버튼 자동 부착(JS)
+        st.markdown(
+            """
+            <script>
+            const attachKoCopyButtons = () => {
+              const areas = document.querySelectorAll('textarea[data-testid="stTextArea"]');
+              areas.forEach((ta, idx) => {
+                if (ta.dataset.copyAttached) return;
+                ta.dataset.copyAttached = "1";
+                const btn = document.createElement('button');
+                btn.innerText = "복사";
+                btn.type = "button";
+                btn.style.marginTop = "6px";
+                btn.style.padding = "4px 8px";
+                btn.style.borderRadius = "6px";
+                btn.style.border = "1px solid #ddd";
+                btn.style.background = "#f5f5f5";
+                btn.style.cursor = "pointer";
+                btn.onclick = async () => {
+                  const val = ta.value || "";
+                  try {
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                      await navigator.clipboard.writeText(val);
+                    } else {
+                      ta.focus();
+                      ta.select();
+                      const ok = document.execCommand('copy');
+                      if (!ok) {
+                        const tmp = document.createElement('textarea');
+                        tmp.value = val;
+                        document.body.appendChild(tmp);
+                        tmp.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(tmp);
+                      }
+                    }
+                    const old = btn.innerText;
+                    btn.innerText = "복사 완료!";
+                    setTimeout(()=>{btn.innerText = old;}, 1000);
+                  } catch(e) {
+                    btn.innerText = "복사 실패";
+                  }
+                };
+                ta.parentNode.appendChild(btn);
+              });
+            };
+            window.addEventListener('load', attachKoCopyButtons);
+            setTimeout(attachKoCopyButtons, 500);
+            </script>
+            """,
+            unsafe_allow_html=True,
+        )
 
         if result.data:
             st.json(result.data, expanded=False)

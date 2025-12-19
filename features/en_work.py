@@ -1130,6 +1130,13 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
             st.error(result.error)
             return
 
+        # 최신 편집 버퍼를 우선 사용 (text_area가 리렌더되며 en_work_edit_area에 저장된 값이 있으면 반영)
+        current_edit = st.session_state.get(
+            "en_work_edit_area",
+            st.session_state.get("en_work_edit", result.output_text),
+        )
+        st.session_state["en_work_edit"] = current_edit
+
         # 새 실행 결과가 이전과 다르면 편집 버퍼를 최신 실행 결과로 동기화
         last_result_text = st.session_state.get("en_work_result_text")
         if result.output_text != last_result_text:
@@ -1138,80 +1145,61 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
             st.session_state.pop("en_work_edit_area", None)
 
         action_current = st.session_state.get("en_work_action", action_key)
-        show_final_render = action_current != "7. 본문 단어배열 서식적용 및 밑줄"
 
-        if show_final_render:
-            st.markdown(
-                """
-                <div style="display:flex; align-items:center; gap:8px; margin: 4px 0 6px 0;">
-                    <div style="font-weight:600; font-size:1.05rem;">📌 최종본 (강조 렌더링)</div>
-                    <button id="en_final_copy_btn" style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
-                        복사
-                    </button>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            final_text = st.session_state.get("en_work_edit", result.output_text) or ""
+        st.markdown("### 📌 최종본 (강조 렌더링)")
+        st.info("**태그(굵게 등)가 포함된 부분은 드래그해서 직접 복사·붙여넣기 해주세요.**")
+        final_text = st.session_state.get("en_work_edit", result.output_text) or ""
 
-            copy_payload = json.dumps(final_text)
-            # 최종본: 강조(strong)만 렌더, 밑줄 태그는 그대로 표시
-            render_fn = render_strong_html
-            st.markdown(
-                "<div style='background:#f7f7f7; border:1px solid #e5e5e5; "
-                "border-radius:8px; padding:12px; line-height:1.8; "
-                "font-weight:400; white-space: pre-wrap;'>"
-                "<style> strong{font-weight:800;} u{text-decoration-thickness:2px;} </style>"
-                f"{render_fn(final_text)}"
-                "</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<textarea id='en_final_copy_src' style='position:absolute; left:-9999px;' aria-hidden='true'>{html.escape(final_text)}</textarea>",
-                unsafe_allow_html=True,
-            )
-            # 텍스트 블록 옆에 추가 복사 버튼(국어와 동일 UX)
-            st.markdown(
-                """
-                <div style="display:flex; justify-content:flex-end; margin:4px 0 6px 0;">
-                    <button id="en_final_copy_btn_secondary" style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
-                        복사
-                    </button>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"""
-                <script>
-                const btnEn = document.getElementById("en_final_copy_btn");
-                const btnEn2 = document.getElementById("en_final_copy_btn_secondary");
-                const copyEnVal = async (btn) => {{
-                  try {{
-                    const hidden = document.getElementById("en_final_copy_src");
-                    const val = hidden ? hidden.value : {copy_payload};
-                    await navigator.clipboard.writeText(val);
-                    if (btn) {{
-                      const old = btn.innerText;
-                      btn.innerText = "복사 완료!";
-                      setTimeout(()=>{{btn.innerText = old;}}, 1200);
-                    }}
-                  }} catch(e) {{
-                    if (btn) btn.innerText = "복사 실패";
-                  }}
-                }};
-                if (btnEn) {{
-                  btnEn.onclick = () => copyEnVal(btnEn);
+        copy_payload = json.dumps(final_text)
+
+        # 최종본: 강조(strong)만 렌더, 밑줄 태그는 그대로 표시
+        render_fn = render_strong_html
+        st.markdown(
+            "<div id='en_final_render_box' style='background:#f7f7f7; border:1px solid #e5e5e5; "
+            "border-radius:8px; padding:12px; line-height:1.8; "
+            "font-weight:400; white-space: pre-wrap;'>"
+            "<style> strong{font-weight:800;} u{text-decoration-thickness:2px;} </style>"
+            f"{render_fn(final_text)}"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        # 최종본 텍스트 코드 블록 + 복사 버튼 (components: 안정적 실행)
+        st.components.v1.html(
+            f"""
+            <div style="display:flex; align-items:center; gap:8px; margin: 8px 0;">
+              <div style="font-weight:600;">📄 최종본 텍스트</div>
+              <button id="copy_btn" type="button"
+                style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
+                복사
+              </button>
+              <span id="copy_msg" style="font-size:12px; color:#666;"></span>
+            </div>
+            <pre style="white-space:pre-wrap; background:#f7f7f7; border:1px solid #e5e5e5; border-radius:8px; padding:12px; max-height:240px; overflow:auto;">{html.escape(final_text)}</pre>
+            <script>
+              const text = {copy_payload};
+              const btn = document.getElementById("copy_btn");
+              const msg = document.getElementById("copy_msg");
+
+              async function doCopy() {{
+                try {{
+                  await navigator.clipboard.writeText(text);
+                  msg.textContent = "복사 완료!";
+                  setTimeout(()=>msg.textContent="", 1200);
+                }} catch (e) {{
+                  msg.textContent = "복사 실패";
+                  console.error(e);
                 }}
-                if (btnEn2) {{
-                  btnEn2.onclick = () => copyEnVal(btnEn2);
-                }}
-                </script>
-                """,
-                unsafe_allow_html=True,
-            )
+              }}
 
-        st.markdown("### ✍️ 결과 편집")
+              if (btn) {{
+                btn.addEventListener("click", doCopy);
+              }}
+            </script>
+            """,
+            height=260,
+            scrolling=True,
+        )
+
         # 위젯 초기값 동기화: 새로운 실행 결과가 있으면 widget state를 초기화
         if "en_work_edit_area" not in st.session_state:
             st.session_state["en_work_edit_area"] = st.session_state.get("en_work_edit", result.output_text)
@@ -1222,33 +1210,67 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
             value=st.session_state.get("en_work_edit", result.output_text),
             key="en_work_edit_area",
         )
+        # text_area 값으로 편집 버퍼 업데이트 (복사/다운로드와 동기화)
+        st.session_state["en_work_edit"] = edited
         edit_copy_payload = json.dumps(edited)
 
         st.markdown(
             """
-            <div style="display:flex; align-items:center; gap:8px; margin: 8px 0 4px 0;">
-                <div style="font-weight:600; font-size:1.05rem;">✍️ 결과 편집</div>
-                <button id="en_edit_copy_btn" style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
-                    복사
-                </button>
-            </div>
             <script>
-            const btnEditEn = document.getElementById("en_edit_copy_btn");
-            if (btnEditEn) {{
-              btnEditEn.onclick = async () => {{
-                try {{
-                  const ta = Array.from(document.querySelectorAll('textarea[data-testid="stTextArea"]'))
-                    .find(el => el.getAttribute("aria-label") === "아래 텍스트를 직접 수정할 수 있어요 (이 값이 최종본이 됩니다).");
-                  const val = ta ? ta.value : "";
-                  await navigator.clipboard.writeText(val);
-                  const old = btnEditEn.innerText;
-                  btnEditEn.innerText = "복사 완료!";
-                  setTimeout(()=>{{btnEditEn.innerText = old;}}, 1200);
-                }} catch(e) {{
-                  btnEditEn.innerText = "복사 실패";
-                }}
-              }};
-            }}
+            // 결과 편집 헤더 복사 버튼 제거 -> 자동 textarea 복사 버튼만 사용
+            </script>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # 모든 textarea에 복사 버튼 자동 부착(JS) - ko_work와 동일 UX
+        st.markdown(
+            """
+            <script>
+            const attachEnCopyButtons = () => {
+              const areas = document.querySelectorAll('textarea[data-testid="stTextArea"]');
+              areas.forEach((ta) => {
+                if (ta.dataset.copyAttached) return;
+                ta.dataset.copyAttached = "1";
+                const btn = document.createElement('button');
+                btn.innerText = "복사";
+                btn.type = "button";
+                btn.style.marginTop = "6px";
+                btn.style.padding = "4px 8px";
+                btn.style.borderRadius = "6px";
+                btn.style.border = "1px solid #ddd";
+                btn.style.background = "#f5f5f5";
+                btn.style.cursor = "pointer";
+                btn.onclick = async () => {
+                  const val = ta.value || "";
+                  try {
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                      await navigator.clipboard.writeText(val);
+                    } else {
+                      ta.focus();
+                      ta.select();
+                      const ok = document.execCommand('copy');
+                      if (!ok) {
+                        const tmp = document.createElement('textarea');
+                        tmp.value = val;
+                        document.body.appendChild(tmp);
+                        tmp.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(tmp);
+                      }
+                    }
+                    const old = btn.innerText;
+                    btn.innerText = "복사 완료!";
+                    setTimeout(()=>{btn.innerText = old;}, 1000);
+                  } catch(e) {
+                    btn.innerText = "복사 실패";
+                  }
+                };
+                ta.parentNode.appendChild(btn);
+              });
+            };
+            window.addEventListener('load', attachEnCopyButtons);
+            setTimeout(attachEnCopyButtons, 500);
             </script>
             """,
             unsafe_allow_html=True,
