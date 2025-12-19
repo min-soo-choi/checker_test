@@ -884,25 +884,25 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
         # -------------------------
         # 미리보기
         # -------------------------
-        st.markdown("### 🔎 미리보기")
-        auto_preview = st.checkbox("입력할 때마다 자동 미리보기", value=True, key="en_work_auto_preview")
+        with st.expander("🔎 미리보기", expanded=False):
+            auto_preview = st.checkbox("입력할 때마다 자동 미리보기", value=True, key="en_work_auto_preview")
 
-        preview_result: Optional[WorkResult] = None
-        if auto_preview and src_text.strip():
-            preview_result = run_action(action_key, src_text, params)
+            preview_result: Optional[WorkResult] = None
+            if auto_preview and src_text.strip():
+                preview_result = run_action(action_key, src_text, params)
 
-            if preview_result.ok:
-                html_in, html_out = highlight_diff_html(src_text, preview_result.output_text)
+                if preview_result.ok:
+                    html_in, html_out = highlight_diff_html(src_text, preview_result.output_text)
 
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown("**입력(변경점 표시)**")
-                    st.markdown(wrap_pre_block(html_in), unsafe_allow_html=True)
-                with c2:
-                    st.markdown("**출력 미리보기(변경점 표시)**")
-                    st.markdown(wrap_pre_block(html_out), unsafe_allow_html=True)
-            else:
-                st.warning(f"미리보기 실패: {preview_result.error}")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown("**입력(변경점 표시)**")
+                        st.markdown(wrap_pre_block(html_in), unsafe_allow_html=True)
+                    with c2:
+                        st.markdown("**출력 미리보기(변경점 표시)**")
+                        st.markdown(wrap_pre_block(html_out), unsafe_allow_html=True)
+                else:
+                    st.warning(f"미리보기 실패: {preview_result.error}")
 
         # -------------------------
         # 실행/초기화

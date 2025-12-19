@@ -277,6 +277,11 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
     with tab:
         st.subheader("🧰 국어 작업")
 
+        # 버튼에서 요청된 입력 덮어쓰기를 위젯 생성 전에 반영
+        pending_input = st.session_state.pop("ko_work_apply_input_value", None)
+        if pending_input is not None:
+            st.session_state["ko_work_input"] = pending_input
+
         text = st.text_area("OCR 텍스트 입력", height=260, key="ko_work_input")
 
         # 기능 선택 (시트 검색 작품 들여쓰기를 최우선으로 표시)
@@ -362,7 +367,7 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
             )
 
         # --- 미리보기 ---
-        with st.expander("🔎 미리보기", expanded=True):
+        with st.expander("🔎 미리보기", expanded=False):
             if not text.strip():
                 st.info("OCR 텍스트를 입력하면 미리보기가 표시됩니다.")
             else:
@@ -446,9 +451,15 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
 
         st.markdown(f"### ✅ {result.title}")
 
+        # 최종본(복사용) - 저장된 값이 없으면 최신 편집본/자동 결과를 사용
+        edited_default = st.session_state.get("ko_work_output_edited", result.output_text)
+        final_text = st.session_state.get("ko_work_output_final", edited_default)
+        st.markdown("#### 📌 최종 확정본(복사용)")
+        st.code(final_text, language="text")
+
         edited = st.text_area(
             "결과 텍스트 (수정 가능)",
-            value=st.session_state.get("ko_work_output_edited", result.output_text),
+            value=edited_default,
             height=260,
             key="ko_work_output_editor",
         )
@@ -468,13 +479,9 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
 
         with c_use:
             if st.button("최종본을 OCR 입력으로 덮어쓰기", key="ko_work_apply_final_to_input"):
-                st.session_state["ko_work_input"] = st.session_state.get("ko_work_output_final", edited)
+                st.session_state["ko_work_apply_input_value"] = final_text
                 st.success("OCR 입력을 최종본으로 교체했어. 필요하면 다시 실행해봐.")
                 st.rerun()
-
-        final_text = st.session_state.get("ko_work_output_final", edited)
-        st.markdown("#### 📌 최종 확정본(복사용)")
-        st.code(final_text, language="text")
 
         if result.data:
             st.json(result.data, expanded=False)
