@@ -3,6 +3,7 @@
 
 import html
 import os
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -470,7 +471,8 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
                     st.success("OCR 입력에 반영했어요. 잠시 후 갱신됩니다.")
                     st.rerun()
 
-        text = st.text_area("OCR 텍스트 입력", height=260, key="ko_work_input")
+        with st.expander("OCR 텍스트 입력", expanded=True):
+            text = st.text_area("OCR 텍스트 입력", height=260, key="ko_work_input")
 
         # 기능 선택 (시트 검색 작품 들여쓰기를 최우선으로 표시)
         preferred_order = ["1. 시트 검색 작품 들여쓰기", "2. PDF 작품 들여쓰기"]
@@ -655,8 +657,41 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
         # 최종본(복사용) - 저장된 값이 없으면 최신 편집본/자동 결과를 사용
         edited_default = st.session_state.get("ko_work_output_edited", result.output_text)
         final_text = st.session_state.get("ko_work_output_final", edited_default)
-        st.markdown("#### 📌 최종 확정본(복사용)")
+        copy_payload = json.dumps(final_text)
+        st.markdown(
+            f"""
+            <div style="display:flex; align-items:center; gap:8px; margin: 4px 0 6px 0;">
+                <div style="font-weight:600;">📌 최종 확정본(복사용)</div>
+                <button id="ko_final_copy_btn" style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
+                    복사
+                </button>
+            </div>
+            <script>
+const btn = document.getElementById("ko_final_copy_btn");
+if (btn) {{
+  btn.onclick = async () => {{
+    try {{
+      const hidden = document.getElementById("ko_final_copy_src");
+      const val = hidden ? hidden.value : {copy_payload};
+      await navigator.clipboard.writeText(val);
+      const old = btn.innerText;
+      btn.innerText = "복사 완료!";
+      setTimeout(()=>{{btn.innerText = old;}}, 1200);
+    }} catch(e) {{
+      btn.innerText = "복사 실패";
+                }}
+              }};
+            }}
+            </script>
+            """,
+            unsafe_allow_html=True,
+        )
         st.code(final_text, language="text")
+        # 숨김 영역에 최신 텍스트를 넣어두고 copy 버튼이 여기서 읽도록 함
+        st.markdown(
+            f"<textarea id='ko_final_copy_src' style='position:absolute; left:-9999px;' aria-hidden='true'>{html.escape(final_text)}</textarea>",
+            unsafe_allow_html=True,
+        )
 
         edited = st.text_area(
             "결과 텍스트 (수정 가능)",
@@ -665,6 +700,35 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
             key="ko_work_output_editor",
         )
         st.session_state["ko_work_output_edited"] = edited
+        st.markdown(
+            f"""
+            <div style="display:flex; align-items:center; gap:8px; margin: 12px 0 4px 0;">
+                <div style="font-weight:600; font-size:1.05rem;">✍️ 결과 텍스트 (수정 가능)</div>
+                <button id="ko_edit_copy_btn" style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
+                    복사
+                </button>
+            </div>
+            <script>
+            const btnEditKo = document.getElementById("ko_edit_copy_btn");
+            if (btnEditKo) {{
+              btnEditKo.onclick = async () => {{
+                try {{
+                  const ta = Array.from(document.querySelectorAll('textarea[data-testid="stTextArea"]'))
+                    .find(el => el.getAttribute("aria-label") === "결과 텍스트 (수정 가능)");
+                  const val = ta ? ta.value : "";
+                  await navigator.clipboard.writeText(val);
+                  const old = btnEditKo.innerText;
+                  btnEditKo.innerText = "복사 완료!";
+                  setTimeout(()=>{{btnEditKo.innerText = old;}}, 1200);
+                }} catch(e) {{
+                  btnEditKo.innerText = "복사 실패";
+                }}
+              }};
+            }}
+            </script>
+            """,
+            unsafe_allow_html=True,
+        )
 
         c_save, c_reset_edit, c_use = st.columns(3)
 

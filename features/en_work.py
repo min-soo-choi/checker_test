@@ -5,6 +5,7 @@ from typing import Callable, Dict, Any, Optional, Tuple
 import html
 import difflib
 import re
+import json
 
 
 @dataclass
@@ -1140,10 +1141,20 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
         show_final_render = action_current != "7. 본문 단어배열 서식적용 및 밑줄"
 
         if show_final_render:
-            st.markdown("### 📌 최종본")
+            st.markdown(
+                """
+                <div style="display:flex; align-items:center; gap:8px; margin: 4px 0 6px 0;">
+                    <div style="font-weight:600; font-size:1.05rem;">📌 최종본 (강조 렌더링)</div>
+                    <button id="en_final_copy_btn" style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
+                        복사
+                    </button>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
             final_text = st.session_state.get("en_work_edit", result.output_text) or ""
 
-            st.markdown("### 📌 최종본 (강조 렌더링)")
+            copy_payload = json.dumps(final_text)
             # 최종본: 강조(strong)만 렌더, 밑줄 태그는 그대로 표시
             render_fn = render_strong_html
             st.markdown(
@@ -1153,6 +1164,50 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
                 "<style> strong{font-weight:800;} u{text-decoration-thickness:2px;} </style>"
                 f"{render_fn(final_text)}"
                 "</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<textarea id='en_final_copy_src' style='position:absolute; left:-9999px;' aria-hidden='true'>{html.escape(final_text)}</textarea>",
+                unsafe_allow_html=True,
+            )
+            # 텍스트 블록 옆에 추가 복사 버튼(국어와 동일 UX)
+            st.markdown(
+                """
+                <div style="display:flex; justify-content:flex-end; margin:4px 0 6px 0;">
+                    <button id="en_final_copy_btn_secondary" style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
+                        복사
+                    </button>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"""
+                <script>
+                const btnEn = document.getElementById("en_final_copy_btn");
+                const btnEn2 = document.getElementById("en_final_copy_btn_secondary");
+                const copyEnVal = async (btn) => {{
+                  try {{
+                    const hidden = document.getElementById("en_final_copy_src");
+                    const val = hidden ? hidden.value : {copy_payload};
+                    await navigator.clipboard.writeText(val);
+                    if (btn) {{
+                      const old = btn.innerText;
+                      btn.innerText = "복사 완료!";
+                      setTimeout(()=>{{btn.innerText = old;}}, 1200);
+                    }}
+                  }} catch(e) {{
+                    if (btn) btn.innerText = "복사 실패";
+                  }}
+                }};
+                if (btnEn) {{
+                  btnEn.onclick = () => copyEnVal(btnEn);
+                }}
+                if (btnEn2) {{
+                  btnEn2.onclick = () => copyEnVal(btnEn2);
+                }}
+                </script>
+                """,
                 unsafe_allow_html=True,
             )
 
@@ -1166,6 +1221,37 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
             height=220,
             value=st.session_state.get("en_work_edit", result.output_text),
             key="en_work_edit_area",
+        )
+        edit_copy_payload = json.dumps(edited)
+
+        st.markdown(
+            """
+            <div style="display:flex; align-items:center; gap:8px; margin: 8px 0 4px 0;">
+                <div style="font-weight:600; font-size:1.05rem;">✍️ 결과 편집</div>
+                <button id="en_edit_copy_btn" style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
+                    복사
+                </button>
+            </div>
+            <script>
+            const btnEditEn = document.getElementById("en_edit_copy_btn");
+            if (btnEditEn) {{
+              btnEditEn.onclick = async () => {{
+                try {{
+                  const ta = Array.from(document.querySelectorAll('textarea[data-testid="stTextArea"]'))
+                    .find(el => el.getAttribute("aria-label") === "아래 텍스트를 직접 수정할 수 있어요 (이 값이 최종본이 됩니다).");
+                  const val = ta ? ta.value : "";
+                  await navigator.clipboard.writeText(val);
+                  const old = btnEditEn.innerText;
+                  btnEditEn.innerText = "복사 완료!";
+                  setTimeout(()=>{{btnEditEn.innerText = old;}}, 1200);
+                }} catch(e) {{
+                  btnEditEn.innerText = "복사 실패";
+                }}
+              }};
+            }}
+            </script>
+            """,
+            unsafe_allow_html=True,
         )
 
         csave, cdl, ccopy = st.columns([1, 1, 2])
@@ -1185,6 +1271,27 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
 
         with ccopy:
             st.caption("※ Streamlit은 ‘클립보드 복사’ 버튼이 기본 제공되지 않아, 텍스트를 드래그해서 복사하면 됩니다.")
+
+        st.markdown(
+            f"""
+            <script>
+            const btnEditEn = document.getElementById("en_edit_copy_btn");
+            if (btnEditEn) {{
+              btnEditEn.onclick = async () => {{
+                try {{
+                  await navigator.clipboard.writeText({edit_copy_payload});
+                  const old = btnEditEn.innerText;
+                  btnEditEn.innerText = "복사 완료!";
+                  setTimeout(()=>{{btnEditEn.innerText = old;}}, 1200);
+                }} catch(e) {{
+                  btnEditEn.innerText = "복사 실패";
+                }}
+              }};
+            }}
+            </script>
+            """,
+            unsafe_allow_html=True,
+        )
 
         st.markdown("### ✅ 실행 결과")
         st.caption(result.title)
