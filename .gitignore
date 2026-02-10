@@ -7,6 +7,7 @@ __pycache__/
 *.pyd
 *.sqlite3
 test_google_auth.py
+output_schema.py
 
 # ------------------------
 # 가상환경(venv)
@@ -47,3 +48,4 @@ cache/
 # ------------------------
 *.log
 *.tmp
+output_schema.py
