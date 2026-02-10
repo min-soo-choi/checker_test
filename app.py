@@ -1,9 +1,14 @@
 # app.py
 # -*- coding: utf-8 -*-
+import base64
+import csv
+import io
 import json
 import time
 import re
 import html
+import os
+import tempfile
 from collections import Counter
 from typing import Dict, Any, List
 from datetime import datetime, timezone
@@ -11,6 +16,7 @@ import uuid
 import traceback
 from features.ko_work import render_ko_work_tab
 from features.en_work import render_en_work_tab
+from output_schema import CLASSIFY_PROMPT_TEMPLATE, get_classify_schema_text
 
 
 import streamlit as st
@@ -237,6 +243,73 @@ def gemini_generate(feature: str, prompt: str, generation_config: dict):
         raise
 
 
+def gemini_generate_with_files(
+    feature: str,
+    prompt: str,
+    files: list[tuple[bytes, str]],
+    generation_config: dict,
+):
+    """
+    ✅ 파일 입력이 필요한 Gemini 호출도 정산/로깅 통일
+    """
+    t0 = time.time()
+    try:
+        resp = None
+        parts: list = []
+        try:
+            types_mod = getattr(genai, "types", None)
+            part_cls = getattr(types_mod, "Part", None) if types_mod else None
+            if part_cls:
+                for data, mime_type in files:
+                    parts.append(part_cls.from_data(data=data, mime_type=mime_type))
+        except Exception:
+            parts = []
+
+        if parts:
+            resp = model.generate_content([prompt, *parts], generation_config=generation_config)
+        else:
+            upload_refs = []
+            tmp_paths: list[str] = []
+            try:
+                for data, mime_type in files:
+                    suffix = ""
+                    if mime_type == "application/pdf":
+                        suffix = ".pdf"
+                    elif mime_type == "image/png":
+                        suffix = ".png"
+                    elif mime_type == "image/jpeg":
+                        suffix = ".jpg"
+                    elif mime_type == "image/webp":
+                        suffix = ".webp"
+
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                        tmp.write(data)
+                        tmp_paths.append(tmp.name)
+
+                for path in tmp_paths:
+                    upload_refs.append(genai.upload_file(path))
+
+                resp = model.generate_content([prompt, *upload_refs], generation_config=generation_config)
+            finally:
+                for path in tmp_paths:
+                    if path and os.path.exists(path):
+                        os.unlink(path)
+        latency_ms = int((time.time() - t0) * 1000)
+
+        usage = _extract_token_usage(resp)
+        cost_usd = calc_gemini_flash_cost_usd(usage["prompt_tokens"], usage["output_tokens"])
+
+        _accumulate_billing(feature, usage, cost_usd)
+        _log_event(feature, "ok", latency_ms, usage, cost_usd, "")
+
+        return resp
+    except Exception as e:
+        latency_ms = int((time.time() - t0) * 1000)
+        usage = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        _log_event(feature, "error", latency_ms, usage, 0.0, str(e))
+        raise
+
+
 # -------------------------------------------------
 # 공통 유틸
 # -------------------------------------------------
@@ -385,6 +458,277 @@ PDF_RESTORE_SYSTEM_PROMPT = """
 
 """
 
+# -------------------------------------------------
+# 문항 분류용 프롬프트 + 유틸
+# -------------------------------------------------
+ITEM_CLASSIFY_SYSTEM_PROMPT = ""
+
+KOR_PARTS_SYSTEM_PROMPT = """
+너는 국어 시험지 PDF/이미지에서 텍스트를 읽어 구조를 분해하는 도우미이다.
+다음 규칙을 반드시 지켜라.
+
+1) 출력은 CSV만 허용한다. 다른 텍스트나 설명은 절대 출력하지 마라.
+2) CSV 첫 줄 헤더는 고정: 페이지,문항번호,구분,내용,작가,작품명,지문_앞3문장,지문_뒤3문장
+3) 페이지는 1부터 시작하는 정수로 표기한다.
+4) 문항번호는 반드시 원기호 숫자(①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳) 형식이다.
+   - 원본에 원기호가 있으면 그대로 유지한다.
+   - 원본에 원기호가 없으면 ①부터 순서대로 부여한다.
+5) 구분은 아래 중 하나만 사용한다:
+   지시문, 발문, 객관식_선지, 주관식_답란, <보기>, <조건>, 각주
+6) 내용에는 해당 구분의 원문 텍스트만 넣고, 불필요한 요약/의역을 하지 마라.
+7) 작품명이 명시되어 있으면 문학 작품으로 간주하고 아래 컬럼을 채운다:
+   - 작가: 작품의 작가명
+   - 작품명: 작품 제목
+   - 지문_앞3문장: 지문에서 앞쪽 3문장
+   - 지문_뒤3문장: 지문에서 뒤쪽 3문장
+8) 작품명이 없으면 작가/작품명/지문_앞3문장/지문_뒤3문장을 빈칸으로 둔다.
+9) 한 문항에 여러 구분이 있으면 행을 여러 개로 나눠라.
+"""
+
+
+def _extract_csv_block(text: str) -> str:
+    if not text:
+        return ""
+    stripped = text.strip()
+    m = re.search(r"```(?:csv)?\n(.*?)\n```", stripped, re.S)
+    if m:
+        return m.group(1).strip()
+    return stripped
+
+
+def _extract_json_block(text: str) -> str:
+    if not text:
+        return ""
+    stripped = text.strip()
+    m = re.search(r"```(?:json)?\n(.*?)\n```", stripped, re.S)
+    if m:
+        return m.group(1).strip()
+    return stripped
+
+
+def _parse_csv_rows(csv_text: str) -> list[dict]:
+    if not csv_text:
+        return []
+    reader = csv.DictReader(io.StringIO(csv_text))
+    rows: list[dict] = []
+    for row in reader:
+        if not row:
+            continue
+        normalized = {}
+        for k, v in row.items():
+            if isinstance(v, list):
+                v = ",".join(str(item) for item in v)
+            v = "" if v is None else str(v)
+            normalized[k] = v.strip()
+        if any(val for val in normalized.values()):
+            rows.append(normalized)
+    return rows
+
+
+def _decode_image_data_url(data_url: str) -> tuple[bytes, str] | None:
+    if not data_url or not data_url.startswith("data:image/"):
+        return None
+    try:
+        header, b64 = data_url.split(",", 1)
+        mime = header.split(";")[0].replace("data:", "")
+        return base64.b64decode(b64), mime
+    except Exception:
+        return None
+
+
+BASE_CLASSIFY_CSS = """
+<style>
+.page {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 10px 12px;
+  font-size: 16px;
+  line-height: 1.65;
+  font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo",
+               "Noto Sans KR", Segoe UI, Roboto, Arial, sans-serif;
+  color: #111;
+}
+.item-card {
+  border: 1px solid #e6e6e6;
+  border-radius: 12px;
+  padding: 14px;
+  margin: 12px 0;
+  background: #fff;
+}
+[data-label="reading-contents"] { margin-bottom: 10px; }
+[data-label="question"] { font-weight: 600; margin: 6px 0 10px 0; }
+.meta-line { margin: 6px 0; }
+.meta-label { font-weight: 600; margin-right: 6px; }
+table.exp-table { width: 100%; border-collapse: collapse; }
+table.exp-table td { vertical-align: top; padding: 6px 0; }
+.bogi-header {
+  text-align: center;
+  font-weight: 700;
+  margin: 12px 0 8px;
+}
+.bogi-box {
+  border: 1px solid #cfcfcf;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fafafa;
+  margin: 6px 0 12px;
+}
+</style>
+"""
+
+
+def _text_to_html_simple(text: str) -> str:
+    if not text:
+        return ""
+    return html.escape(text).replace("\n", "<br>")
+
+
+def _format_bogi_header(html_text: str) -> str:
+    if not html_text:
+        return ""
+    token_re = r"(&lt;보기&gt;|<보기>)"
+    parts = re.split(token_re, html_text)
+    if len(parts) == 1:
+        return html_text
+    out = [parts[0]]
+    for i in range(1, len(parts), 2):
+        body = parts[i + 1] if i + 1 < len(parts) else ""
+        out.append("<div class='bogi-header'>&lt;보기&gt;</div>")
+        out.append(f"<div class='bogi-box'>{body}</div>")
+    return "".join(out)
+
+
+def _build_classify_html(rows: list[dict]) -> str:
+    cols = [
+        "그룹문제_지시문",
+        "본문",
+        "단일문제_지시문",
+        "<보기>",
+        "<조건>",
+        "객관식_선지",
+        "주관식_선지",
+    ]
+    grouped: dict[str, dict[str, list[str]]] = {}
+    order: list[str] = []
+    for row in rows:
+        qnum = (row.get("문항번호") or "").strip()
+        if not qnum:
+            continue
+        if qnum not in grouped:
+            grouped[qnum] = {c: [] for c in cols}
+            order.append(qnum)
+        for c in cols:
+            val = (row.get(c) or "").strip()
+            if val:
+                grouped[qnum][c].append(val)
+
+    cards = []
+    for qnum in order:
+        data = grouped[qnum]
+        group_prompt = "\n".join(dict.fromkeys(data["그룹문제_지시문"]))
+        passage = "\n".join(dict.fromkeys(data["본문"]))
+        single_prompt = "\n".join(dict.fromkeys(data["단일문제_지시문"]))
+        bogi = "\n".join(dict.fromkeys(data["<보기>"]))
+        condition = "\n".join(dict.fromkeys(data["<조건>"]))
+        mc = "\n".join(dict.fromkeys(data["객관식_선지"]))
+        sa = "\n".join(dict.fromkeys(data["주관식_선지"]))
+
+        parts = [f"<div class='item-card'>", f"<div data-label='question'>문항 {html.escape(qnum)}</div>"]
+        if group_prompt:
+            parts.append(
+                f"<div class='meta-line'><span class='meta-label'>그룹문제 지시문</span>{_text_to_html_simple(group_prompt)}</div>"
+            )
+        if passage:
+            parts.append(
+                f"<div data-label='reading-contents'>{_text_to_html_simple(passage)}</div>"
+            )
+        if single_prompt:
+            parts.append(
+                f"<div data-label='question'>{_text_to_html_simple(single_prompt)}</div>"
+            )
+
+        if bogi:
+            bogi_html = _format_bogi_header(_text_to_html_simple(f"<보기>\n{bogi}"))
+            parts.append(bogi_html)
+        if condition:
+            cond_html = _text_to_html_simple(condition)
+            parts.append(
+                f"<div class='meta-line'><span class='meta-label'>&lt;조건&gt;</span>{cond_html}</div>"
+            )
+        if mc or sa:
+            parts.append("<table class='exp-table'>")
+            if mc:
+                parts.append(
+                    f"<tr><td style='width:120px;'><strong>객관식 선지</strong></td><td>{_text_to_html_simple(mc)}</td></tr>"
+                )
+            if sa:
+                parts.append(
+                    f"<tr><td style='width:120px;'><strong>주관식 답란</strong></td><td>{_text_to_html_simple(sa)}</td></tr>"
+                )
+            parts.append("</table>")
+
+        parts.append("</div>")
+        cards.append("".join(parts))
+
+    body = "".join(cards) if cards else "<div>표시할 문항이 없습니다.</div>"
+    return f"{BASE_CLASSIFY_CSS}<div class='page'>{body}</div>"
+
+
+def _build_classify_html_from_json(items: list[dict]) -> str:
+    cards = []
+    for item in items:
+        qnum = str(item.get("question_num") or "").strip()
+        group_prompt = str(item.get("group_prompt") or "").strip()
+        passage = str(item.get("passage") or "").strip()
+        single_prompt = str(item.get("single_prompt") or "").strip()
+        example = str(item.get("example") or "").strip()
+        condition = str(item.get("condition") or "").strip()
+        mc = str(item.get("mc_choices") or "").strip()
+        sa = str(item.get("sa_blank") or "").strip()
+
+        if not any([qnum, group_prompt, passage, single_prompt, example, condition, mc, sa]):
+            continue
+
+        parts = [f"<div class='item-card'>"]
+        if qnum:
+            parts.append(f"<div data-label='question'>문항 {html.escape(qnum)}</div>")
+        if group_prompt:
+            parts.append(
+                f"<div class='meta-line'><span class='meta-label'>그룹문제 지시문</span>{_text_to_html_simple(group_prompt)}</div>"
+            )
+        if passage:
+            parts.append(
+                f"<div data-label='reading-contents'>{_text_to_html_simple(passage)}</div>"
+            )
+        if single_prompt:
+            parts.append(
+                f"<div data-label='question'>{_text_to_html_simple(single_prompt)}</div>"
+            )
+        if example:
+            bogi_html = _format_bogi_header(_text_to_html_simple(f"<보기>\n{example}"))
+            parts.append(bogi_html)
+        if condition:
+            cond_html = _text_to_html_simple(condition)
+            parts.append(
+                f"<div class='meta-line'><span class='meta-label'>&lt;조건&gt;</span>{cond_html}</div>"
+            )
+        if mc or sa:
+            parts.append("<table class='exp-table'>")
+            if mc:
+                parts.append(
+                    f"<tr><td style='width:120px;'><strong>객관식 선지</strong></td><td>{_text_to_html_simple(mc)}</td></tr>"
+                )
+            if sa:
+                parts.append(
+                    f"<tr><td style='width:120px;'><strong>주관식 답란</strong></td><td>{_text_to_html_simple(sa)}</td></tr>"
+                )
+            parts.append("</table>")
+        parts.append("</div>")
+        cards.append("".join(parts))
+
+    body = "".join(cards) if cards else "<div>표시할 문항이 없습니다.</div>"
+    return f"{BASE_CLASSIFY_CSS}<div class='page'>{body}</div>"
+
 
 def normalize_inline_answer_marker(text: str) -> str:
     if not text:
@@ -472,7 +816,7 @@ def ensure_wrong_explanation_linebreaks(text: str) -> str:
                 out.append(part.strip() if part.strip() else "")
         else:
             out.append(line)
-
+  
     return "\n".join(out)
 
 
@@ -1624,8 +1968,18 @@ st.set_page_config(page_title="AI 검수기 (Gemini)", page_icon="📚", layout=
 st.title("📚 Delta 작업자 Test (Gemini 기반)")
 st.caption("한국어/영어 단일 텍스트 + 해설 양식 변환 (오탈자/형식 위주, 스타일 제안 금지).")
 
-tab_ko, tab_en, tab_ko_work, tab_en_work, tab_pdf, tab_about, tab_debug = st.tabs(
-    ["✏️ 한국어 검수", "✏️ 영어 검수", "🧰 국어 작업", "🧰 영어 작업", "📄 해설 텍스트 정리", "ℹ️ 설명", "🐞 디버그"]
+tab_ko, tab_en, tab_ko_work, tab_en_work, tab_classify, tab_parts, tab_pdf, tab_about, tab_debug = st.tabs(
+    [
+        "✏️ 한국어 검수",
+        "✏️ 영어 검수",
+        "🧰 국어 작업",
+        "🧰 영어 작업",
+        "🧩 문항 분류",
+        "🧷 국어 문항 요소",
+        "📄 해설 텍스트 정리",
+        "ℹ️ 설명",
+        "🐞 디버그",
+    ]
 )
 
 render_ko_work_tab(
@@ -1884,6 +2238,238 @@ with tab_en:
                 st.json(raw_json.get("detector_clean", {}))
             with st.expander("2차 Judge JSON (필요 시)", expanded=False):
                 st.json(raw_json.get("judge_clean", {}))
+
+
+# --- 문항 분류 탭 ---
+with tab_classify:
+    st.subheader("🧩 문항 분류 (PDF/이미지)")
+    st.caption("PDF/이미지를 업로드하면 구성 요소를 JSON으로 분류해 카드로 제공합니다. 원기호 번호는 그대로 유지됩니다.")
+
+    uploaded_files = st.file_uploader(
+        "PDF 또는 이미지 업로드 (여러 파일 가능, 업로드 순서=페이지 순서)",
+        type=["pdf", "png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key="classify_files",
+    )
+
+    if "classify_paste_images" not in st.session_state:
+        st.session_state["classify_paste_images"] = []
+    if "classify_paste_last" not in st.session_state:
+        st.session_state["classify_paste_last"] = ""
+
+    st.markdown(
+        """
+        <style>
+        textarea[aria-label="클립보드 이미지 데이터"] {display:none;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    paste_data = st.text_area("클립보드 이미지 데이터", key="classify_paste_data", height=80)
+
+    st.components.v1.html(
+        """
+        <div style="display:flex; align-items:center; gap:8px; margin:6px 0 10px 0;">
+          <button id="paste_image_btn" style="padding:6px 10px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
+            클립보드 이미지 붙여넣기
+          </button>
+          <span id="paste_image_msg" style="font-size:12px; color:#666;"></span>
+        </div>
+        <script>
+        const btn = document.getElementById("paste_image_btn");
+        const msg = document.getElementById("paste_image_msg");
+        const target = Array.from(document.querySelectorAll('textarea[aria-label="클립보드 이미지 데이터"]'))[0];
+
+        async function setMsg(text) {
+          if (msg) msg.textContent = text;
+        }
+
+        async function pasteImage() {
+          try {
+            if (!navigator.clipboard || !navigator.clipboard.read) {
+              setMsg("브라우저가 클립보드 읽기를 지원하지 않습니다.");
+              return;
+            }
+            const items = await navigator.clipboard.read();
+            for (const item of items) {
+              const type = item.types.find(t => t.startsWith("image/"));
+              if (!type) continue;
+              const blob = await item.getType(type);
+              const reader = new FileReader();
+              reader.onload = () => {
+                if (target) {
+                  target.value = reader.result;
+                  target.dispatchEvent(new Event("input", { bubbles: true }));
+                  setMsg("붙여넣기 완료!");
+                }
+              };
+              reader.readAsDataURL(blob);
+              return;
+            }
+            setMsg("클립보드에 이미지가 없습니다.");
+          } catch (e) {
+            setMsg("붙여넣기 실패");
+          }
+        }
+
+        if (btn) btn.onclick = pasteImage;
+        </script>
+        """,
+        height=52,
+    )
+
+    col_paste1, col_paste2 = st.columns([1, 2])
+    with col_paste1:
+        if st.button("붙여넣은 이미지 초기화", key="classify_paste_reset"):
+            st.session_state["classify_paste_images"] = []
+            st.session_state["classify_paste_last"] = ""
+            st.session_state["classify_paste_data"] = ""
+            st.rerun()
+    with col_paste2:
+        st.caption("붙여넣기 버튼을 눌러 클립보드 이미지를 추가할 수 있습니다.")
+
+    if paste_data and paste_data != st.session_state["classify_paste_last"]:
+        decoded = _decode_image_data_url(paste_data)
+        if decoded:
+            st.session_state["classify_paste_images"].append(decoded)
+            st.session_state["classify_paste_last"] = paste_data
+        else:
+            st.warning("클립보드 이미지 데이터를 해석할 수 없습니다.")
+
+    col_c1, col_c2 = st.columns([1, 1])
+    with col_c1:
+        run_classify = st.button("문항 분류 실행", type="primary", key="classify_run")
+    with col_c2:
+        st.caption("JSON 스키마는 output_schema.py 기준으로 출력됩니다.")
+
+    if run_classify:
+        if not uploaded_files and not st.session_state["classify_paste_images"]:
+            st.warning("먼저 PDF 또는 이미지를 업로드하거나 클립보드 이미지를 붙여넣어주세요.")
+            st.stop()
+
+        file_payloads: list[tuple[bytes, str]] = []
+        if uploaded_files:
+            for f in uploaded_files:
+                mime_type = f.type or "application/octet-stream"
+                if mime_type == "application/octet-stream":
+                    name_lower = (f.name or "").lower()
+                    if name_lower.endswith(".pdf"):
+                        mime_type = "application/pdf"
+                    elif name_lower.endswith(".png"):
+                        mime_type = "image/png"
+                    elif name_lower.endswith(".jpg") or name_lower.endswith(".jpeg"):
+                        mime_type = "image/jpeg"
+                    elif name_lower.endswith(".webp"):
+                        mime_type = "image/webp"
+                file_payloads.append((f.getvalue(), mime_type))
+
+        if st.session_state["classify_paste_images"]:
+            file_payloads.extend(st.session_state["classify_paste_images"])
+
+        prompt = CLASSIFY_PROMPT_TEMPLATE.format(
+            all_relevant_texts="(첨부된 PDF/이미지 참조)",
+            json_schema=get_classify_schema_text(),
+        )
+
+        with st.spinner("Gemini가 문항을 분류하는 중입니다..."):
+            response = gemini_generate_with_files(
+                feature="item_classify",
+                prompt=prompt,
+                files=file_payloads,
+                generation_config={"temperature": 0.0},
+            )
+
+        json_text = _extract_json_block(getattr(response, "text", "") or "")
+        st.session_state["classify_json"] = json_text
+
+    classify_json = st.session_state.get("classify_json", "")
+    if classify_json:
+        st.markdown("#### ✅ 분류 결과")
+        try:
+            parsed = json.loads(classify_json)
+        except Exception:
+            st.info("JSON 파싱에 실패했습니다. 아래 원문을 확인해주세요.")
+            st.code(classify_json)
+        else:
+            items = parsed.get("items") if isinstance(parsed, dict) else None
+            if not isinstance(items, list):
+                st.info("JSON 구조가 스키마와 다릅니다. 아래 원문을 확인해주세요.")
+                st.code(classify_json)
+            else:
+                html_doc = _build_classify_html_from_json(items)
+                st.components.v1.html(html_doc, height=900, scrolling=True)
+
+        st.markdown("#### 📄 JSON 다운로드")
+        st.download_button(
+            "JSON 다운로드",
+            data=classify_json,
+            file_name="item_classification.json",
+            mime="application/json",
+        )
+
+
+# --- 국어 문항 요소 분해 탭 ---
+with tab_parts:
+    st.subheader("🧷 국어 문항 요소 분해")
+    st.caption("국어 시험지 PDF/이미지에서 지시문, 발문, 선지, 답란, <보기>, <조건>, 각주를 분리합니다.")
+
+    parts_file = st.file_uploader(
+        "PDF 또는 이미지 업로드",
+        type=["pdf", "png", "jpg", "jpeg", "webp"],
+        key="parts_file",
+    )
+
+    col_p1, col_p2 = st.columns([1, 1])
+    with col_p1:
+        run_parts = st.button("문항 요소 분해 실행", type="primary", key="parts_run")
+    with col_p2:
+        st.caption("CSV 헤더: 페이지,문항번호,구분,내용,작가,작품명,지문_앞3문장,지문_뒤3문장")
+
+    if run_parts:
+        if not parts_file:
+            st.warning("먼저 PDF 또는 이미지를 업로드해주세요.")
+        else:
+            mime_type = parts_file.type or "application/octet-stream"
+            if mime_type == "application/octet-stream":
+                name_lower = (parts_file.name or "").lower()
+                if name_lower.endswith(".pdf"):
+                    mime_type = "application/pdf"
+                elif name_lower.endswith(".png"):
+                    mime_type = "image/png"
+                elif name_lower.endswith(".jpg") or name_lower.endswith(".jpeg"):
+                    mime_type = "image/jpeg"
+                elif name_lower.endswith(".webp"):
+                    mime_type = "image/webp"
+
+            file_bytes = parts_file.getvalue()
+
+            with st.spinner("Gemini가 문항 요소를 분해하는 중입니다..."):
+                response = gemini_generate_with_files(
+                    feature="kor_item_parts",
+                    prompt=KOR_PARTS_SYSTEM_PROMPT,
+                    files=[(file_bytes, mime_type)],
+                    generation_config={"temperature": 0.0},
+                )
+
+            csv_text = _extract_csv_block(getattr(response, "text", "") or "")
+            st.session_state["parts_csv"] = csv_text
+
+    parts_csv = st.session_state.get("parts_csv", "")
+    if parts_csv:
+        st.markdown("#### ✅ 분해 결과")
+        rows = _parse_csv_rows(parts_csv)
+        if rows:
+            st.dataframe(rows, use_container_width=True)
+        else:
+            st.info("CSV 파싱에 실패했습니다. 아래 원문을 확인해주세요.")
+            st.code(parts_csv)
+
+        st.download_button(
+            "CSV 다운로드",
+            data=parts_csv,
+            file_name="kor_item_parts.csv",
+            mime="text/csv",
+        )
 
 
 # --- PDF 텍스트 정리 탭 ---
