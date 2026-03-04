@@ -2320,11 +2320,12 @@ with tab_classify:
 
     col_paste1, col_paste2 = st.columns([1, 2])
     with col_paste1:
-        if st.button("붙여넣은 이미지 초기화", key="classify_paste_reset"):
+        def _reset_classify_paste():
             st.session_state["classify_paste_images"] = []
             st.session_state["classify_paste_last"] = ""
             st.session_state["classify_paste_data"] = ""
-            st.rerun()
+
+        st.button("붙여넣은 이미지 초기화", key="classify_paste_reset", on_click=_reset_classify_paste)
     with col_paste2:
         st.caption("붙여넣기 버튼을 눌러 클립보드 이미지를 추가할 수 있습니다.")
 
