@@ -366,6 +366,8 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
             search = st.button("시트 조회", key="ko_sheet_search")
             if search:
                 try:
+                    # 최신 시트 내용을 보기 위해 캐시를 비웁니다.
+                    load_sheet_rows.clear()
                     rows = load_sheet_rows(sheet_tab)
                     q_author_l = q_author.strip().lower()
                     q_title_l = q_title.strip().lower()
