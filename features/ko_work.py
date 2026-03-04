@@ -391,6 +391,20 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
                     st.session_state["ko_sheet_results"] = []
                     st.warning(f"시트 조회 실패: {e}")
 
+            debug = st.button("헤더/샘플 확인", key="ko_sheet_debug")
+            if debug:
+                try:
+                    rows = load_sheet_rows(sheet_tab)
+                    if not rows:
+                        st.info("해당 탭에 데이터가 없습니다.")
+                    else:
+                        # 헤더는 get_all_records()의 key로 제공됨
+                        headers = list(rows[0].keys())
+                        st.write("헤더:", headers)
+                        st.json(rows[:3])
+                except Exception as e:
+                    st.warning(f"헤더/샘플 확인 실패: {e}")
+
             results = st.session_state.get("ko_sheet_results", [])
             if results:
                 def _hilite(text: str, needle: str) -> str:
