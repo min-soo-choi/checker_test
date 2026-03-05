@@ -109,7 +109,12 @@ def run_action(action_key: str, text: str, params: Dict[str, Any]) -> WorkResult
 # =========================
 
 SHEET_ID_DEFAULT: Optional[str] = None  # secrets.toml의 sheet_id 사용
-SHEET_TABS = ["KOR_paragraph_db의_모의고사", "KOR_paragraph_db의_교과서"]
+SHEET_TABS = [
+    "KOR_paragraph_db의_모의고사",
+    "KOR_paragraph_db의_교과서",
+    "KOR_paragraph_db의_참고서",
+    "KOR_paragraph_db의_중학교과서",
+]
 SERVICE_ACCOUNT_FILE = Path(__file__).resolve().parent.parent / "expertupdate-ec3c7ee5b4d6.json"
 
 
