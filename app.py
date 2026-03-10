@@ -1976,12 +1976,32 @@ def extract_english_suggestions_from_raw(raw: dict) -> list[str]:
 # -------------------------------------------------
 # 2. Streamlit UI (기존 유지)
 # -------------------------------------------------
+SPECIAL_SYMBOL_COLLECTIONS: dict[str, str] = {
+    "원문자 (숫자)": "① ② ③ ④ ⑤ ⑥ ⑦ ⑧ ⑨ ⑩ ⑪ ⑫ ⑬ ⑭ ⑮",
+    "원문자 (자모)": "㉠ ㉡ ㉢ ㉣ ㉤ ㉥ ㉦ ㉧ ㉨ ㉩ ㉪ ㉫ ㉬ ㉭",
+    "겹받침 자모": "ㄳ ㄵ ㄶ ㄺ ㄻ ㄼ ㄽ ㄾ ㄿ ㅀ ㅄ",
+    "화살표/흐름": "➝ → ➜ ⇢ ⇒ ⇨ ↔ ↕ ↑ ↓ ↗ ↘ ↙ ↖ ⇄ ⇆",
+    "로마숫자": "Ⅰ Ⅱ Ⅲ Ⅳ Ⅴ Ⅵ Ⅶ Ⅷ Ⅸ Ⅹ Ⅺ Ⅻ ⅰ ⅱ ⅲ ⅳ ⅴ ⅵ ⅶ ⅷ ⅸ ⅹ ⅺ ⅻ",
+    "위첨자 (숫자/기본기호)": "⁰ ¹ ² ³ ⁴ ⁵ ⁶ ⁷ ⁸ ⁹ ⁺ ⁻ ⁼ ⁽ ⁾ ⁿ ⁱ",
+    "아래첨자 (숫자/기본기호)": "₀ ₁ ₂ ₃ ₄ ₅ ₆ ₇ ₈ ₉ ₊ ₋ ₌ ₍ ₎",
+    "위첨자 (알파벳)": "ᴬ ᴮ ᴰ ᴱ ᴳ ᴴ ᴵ ᴶ ᴷ ᴸ ᴹ ᴺ ᴼ ᴾ ᴿ ᵀ ᵁ ⱽ ᵂ ᵃ ᵇ ᶜ ᵈ ᵉ ᶠ ᵍ ʰ ⁱ ʲ ᵏ ˡ ᵐ ⁿ ᵒ ᵖ ʳ ˢ ᵗ ᵘ ᵛ ʷ ˣ ʸ ᶻ",
+    "아래첨자 (알파벳 일부)": "ₐ ₑ ₕ ᵢ ⱼ ₖ ₗ ₘ ₙ ₒ ₚ ᵣ ₛ ₜ ᵤ ᵥ ₓ",
+    "화학식 (일반 숫자)": "H2O CO2 O2 N2 H2 CH4 NH3 HCl NaCl CaCO3 Fe2O3",
+    "화학식 (아래첨자)": "H₂O CO₂ O₂ N₂ H₂ CH₄ NH₃ HCl NaCl CaCO₃ Fe₂O₃",
+    "화학 단위/기호": "Δ δ λ μ ν α β γ ℃ ℉ ° pH mol M N mL L g kg mg μg mM ppm ppb",
+    "반응/평형 기호": "→ ← ↔ ⇌ ⟶ ⟵ ↑ ↓",
+    "장단조/성조 모음": "ă ĕ ĭ ŏ ŭ ā ē ī ō ū ǎ ě ǐ ǒ ǔ",
+    "따옴표/괄호": "\" \" ' ' “ ” ‘ ’ 「 」 『 』 ( ) [ ] { } 〈 〉 《 》",
+    "수학/논리": "± × ÷ ∑ ∏ ∞ ≠ ≈ ≤ ≥ √ ∴ ∵",
+    "기호/문장부호": "· • ※ ○ ● □ ■ △ ▲ ◇ ◆ ☆ ★",
+}
+
 st.set_page_config(page_title="AI 검수기 (Gemini)", page_icon="📚", layout="wide")
 
 st.title("📚 Delta 작업자 Test (Gemini 기반)")
 st.caption("한국어/영어 단일 텍스트 + 해설 양식 변환 (오탈자/형식 위주, 스타일 제안 금지).")
 
-tab_ko, tab_en, tab_ko_work, tab_en_work, tab_classify, tab_parts, tab_pdf, tab_about, tab_debug = st.tabs(
+tab_ko, tab_en, tab_ko_work, tab_en_work, tab_classify, tab_parts, tab_pdf, tab_symbols, tab_about, tab_debug = st.tabs(
     [
         "✏️ 한국어 검수",
         "✏️ 영어 검수",
@@ -1990,6 +2010,7 @@ tab_ko, tab_en, tab_ko_work, tab_en_work, tab_classify, tab_parts, tab_pdf, tab_
         "🧩 문항 분류",
         "🧷 국어 문항 요소",
         "📄 해설 텍스트 정리",
+        "🔣 특수 기호 조회",
         "ℹ️ 설명",
         "🐞 디버그",
     ]
@@ -2516,6 +2537,19 @@ with tab_pdf:
             st.session_state["pdf_cleaned"] = remove_first_line_in_code_block(cleaned_block)
             st.rerun()
         st.markdown(st.session_state["pdf_cleaned"])
+
+
+# --- 특수 기호 조회 탭 ---
+with tab_symbols:
+    st.subheader("🔣 특수 기호 조회")
+    st.caption("자주 쓰는 특수 기호 모음집을 한 번에 확인하고 복사할 수 있습니다.")
+
+    st.markdown("#### 빠른 복사용 모음")
+    st.code("\n".join(SPECIAL_SYMBOL_COLLECTIONS.values()), language="text")
+
+    for title, symbols in SPECIAL_SYMBOL_COLLECTIONS.items():
+        st.markdown(f"#### {title}")
+        st.code(symbols, language="text")
 
 
 # --- 설명 탭 (원본 유지: 길이 때문에 기존과 동일하게 두어도 기능 영향 없음) ---
