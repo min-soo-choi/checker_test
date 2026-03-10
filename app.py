@@ -406,6 +406,8 @@ PDF_RESTORE_SYSTEM_PROMPT = """
 4. 문장 및 서식 정리 (가독성 최적화)
 - 줄바꿈 병합:
   문장의 중간이 어색하게 끊겨 있는 경우, 이를 공백으로 치환하여 자연스럽게 연결한다.
+- 화살표 표기 통일:
+  연결 기호로 쓰인 ->, =>, →, ➜ 표기는 모두 ➝로 통일한다.
 - 번호 목록 분리:
   문장 중간이나 끝에 원 문자(①, ②, ③… / ㉠, ㉡…)가 붙어 있는 경우
   반드시 줄을 바꾼 뒤 번호를 시작한다.
@@ -820,12 +822,21 @@ def ensure_wrong_explanation_linebreaks(text: str) -> str:
     return "\n".join(out)
 
 
+def normalize_arrow_connectors(text: str) -> str:
+    if not text:
+        return text
+    # 단계/흐름 연결 기호를 단일 표기(➝)로 통일
+    return re.sub(r"\s*(?:->|=>|→|➜)\s*", " ➝ ", text)
+
+
 def restore_pdf_text(raw_text: str) -> str:
     """
     ✅ (정산 적용) PDF 정리도 gemini_generate로 호출
     """
     if not raw_text:
         return ""
+
+    preprocessed_text = normalize_arrow_connectors(raw_text)
 
     prompt = f"""{PDF_RESTORE_SYSTEM_PROMPT}
 
@@ -835,7 +846,7 @@ def restore_pdf_text(raw_text: str) -> str:
 반드시 정리된 최종 텍스트만 코드 블록 안에 넣어서 출력할 것.
 
 [원본 텍스트 시작]
-{raw_text}
+{preprocessed_text}
 [원본 텍스트 끝]
 """
 
@@ -855,12 +866,14 @@ def restore_pdf_text(raw_text: str) -> str:
         inner = normalize_explanation_headers(inner)
         inner = ensure_wrong_explanation_linebreaks(inner)
         inner = tighten_between_answer_blocks(inner)
+        inner = normalize_arrow_connectors(inner)
         stripped = f"```text\n{inner}\n```"
     else:
         inner = normalize_inline_answer_marker(stripped)
         inner = normalize_explanation_headers(inner)
         inner = ensure_wrong_explanation_linebreaks(inner)
         inner = tighten_between_answer_blocks(inner)
+        inner = normalize_arrow_connectors(inner)
         stripped = f"```text\n{inner}\n```"
 
     return stripped
