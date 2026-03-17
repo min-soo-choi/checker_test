@@ -5,6 +5,7 @@ import html
 import os
 import json
 import re
+import difflib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -230,6 +231,35 @@ def apply_non_literature_indentation(text: str, indent: str = " ") -> str:
         else:
             out.append(indent + line.lstrip())
     return "\n".join(out)
+
+
+def _normalize_diff_text(text: str) -> str:
+    """
+    diff 비교용 정규화:
+    - <br> 계열을 줄바꿈으로 통일
+    - CRLF/CR을 LF로 통일
+    """
+    return normalize_linebreaks(text or "")
+
+
+def _diff_stats(base_text: str, compare_text: str) -> Dict[str, int]:
+    """
+    unified diff 결과에서 추가/삭제 라인 수를 계산.
+    """
+    base_lines = _normalize_diff_text(base_text).splitlines()
+    compare_lines = _normalize_diff_text(compare_text).splitlines()
+    diff_lines = difflib.unified_diff(base_lines, compare_lines, lineterm="")
+
+    added = 0
+    removed = 0
+    for line in diff_lines:
+        if line.startswith("+++ ") or line.startswith("--- ") or line.startswith("@@"):
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+    return {"added": added, "removed": removed}
 
 
 def break_after_anchors(text: str, anchors: List[str]) -> str:
@@ -491,6 +521,58 @@ def render_ko_work_tab(tab, st, *, review_korean_text=None):
                     st.session_state["ko_work_apply_input_value"] = str(chosen.get("지문 텍스트", "")).strip()
                     st.success("OCR 입력에 반영했어요. 잠시 후 갱신됩니다.")
                     st.rerun()
+
+                chosen = results[sel_idx]
+                sheet_passage = str(chosen.get("지문 텍스트", ""))
+                st.divider()
+                st.markdown("**🧪 지문 Diff 비교**")
+                st.caption("선택한 시트 지문과 복사한 텍스트를 라인 단위로 비교합니다.")
+                pasted_text = st.text_area(
+                    "비교할 텍스트 붙여넣기",
+                    key="ko_sheet_diff_input",
+                    height=180,
+                    placeholder="다른 곳에서 복사한 지문 텍스트를 붙여넣어 주세요.",
+                )
+                compare = st.button("Diff 비교", key="ko_sheet_diff_compare")
+
+                if compare:
+                    if sheet_passage == "":
+                        st.warning("선택한 시트 지문이 비어 있습니다.")
+                    elif pasted_text == "":
+                        st.warning("비교할 텍스트를 입력해 주세요.")
+                    else:
+                        base = _normalize_diff_text(sheet_passage)
+                        comp = _normalize_diff_text(pasted_text)
+                        if base == comp:
+                            st.success("두 텍스트가 동일합니다.")
+                        else:
+                            stats = _diff_stats(base, comp)
+                            st.warning(
+                                f"차이 발견: 추가 {stats['added']}줄 / 삭제 {stats['removed']}줄"
+                            )
+                            html_diff = difflib.HtmlDiff(wrapcolumn=80).make_table(
+                                base.splitlines(),
+                                comp.splitlines(),
+                                fromdesc="시트 지문",
+                                todesc="비교 텍스트",
+                                context=True,
+                                numlines=2,
+                            )
+                            st.components.v1.html(
+                                f"""
+                                <style>
+                                  table.diff {{font-family: monospace; font-size: 12px; width: 100%; border-collapse: collapse;}}
+                                  .diff_header {{background: #f4f6f8;}}
+                                  td, th {{padding: 3px 6px; vertical-align: top;}}
+                                  .diff_add {{background: #e6ffed;}}
+                                  .diff_sub {{background: #ffeef0;}}
+                                  .diff_chg {{background: #fff5b1;}}
+                                </style>
+                                {html_diff}
+                                """,
+                                height=420,
+                                scrolling=True,
+                            )
 
         with st.expander("OCR 텍스트 입력", expanded=True):
             text = st.text_area("OCR 텍스트 입력", height=260, key="ko_work_input")

@@ -822,6 +822,33 @@ def ensure_wrong_explanation_linebreaks(text: str) -> str:
     return "\n".join(out)
 
 
+def merge_circled_symbol_only_lines(text: str) -> str:
+    if not text:
+        return text
+
+    lines = text.splitlines()
+    out: List[str] = []
+    i = 0
+    # "①," / "①, ②, ④," / "⑤" 처럼 원기호 + 구분자(쉼표/공백)만 있는 줄
+    symbol_series_re = re.compile(r"^(?:[①-⑳㉠-㉿]\s*[,،]?\s*)+$")
+
+    while i < len(lines):
+        if symbol_series_re.match(lines[i].strip()):
+            group: List[str] = []
+            j = i
+            while j < len(lines) and symbol_series_re.match(lines[j].strip()):
+                group.append(lines[j].strip())
+                j += 1
+            out.append(" ".join(group))
+            i = j
+            continue
+
+        out.append(lines[i])
+        i += 1
+
+    return "\n".join(out)
+
+
 def normalize_arrow_connectors(text: str) -> str:
     if not text:
         return text
@@ -865,6 +892,7 @@ def restore_pdf_text(raw_text: str) -> str:
         inner = normalize_inline_answer_marker(inner)
         inner = normalize_explanation_headers(inner)
         inner = ensure_wrong_explanation_linebreaks(inner)
+        inner = merge_circled_symbol_only_lines(inner)
         inner = tighten_between_answer_blocks(inner)
         inner = normalize_arrow_connectors(inner)
         stripped = f"```text\n{inner}\n```"
@@ -872,6 +900,7 @@ def restore_pdf_text(raw_text: str) -> str:
         inner = normalize_inline_answer_marker(stripped)
         inner = normalize_explanation_headers(inner)
         inner = ensure_wrong_explanation_linebreaks(inner)
+        inner = merge_circled_symbol_only_lines(inner)
         inner = tighten_between_answer_blocks(inner)
         inner = normalize_arrow_connectors(inner)
         stripped = f"```text\n{inner}\n```"
@@ -888,9 +917,120 @@ def remove_first_line_in_code_block(block: str) -> str:
     inner = m.group(1) if m else stripped
 
     lines = inner.splitlines()
+    if lines and lines[0].lstrip().startswith("[정답 해설]"):
+        return block
     new_inner = "\n".join(lines[1:]) if lines else ""
 
     return f"```text\n{new_inner}\n```" if m else new_inner
+
+
+def split_pdf_cleaned_by_question(block: str) -> List[str]:
+    if not block:
+        return []
+
+    stripped = block.strip()
+    m = re.match(r"^```[^\n]*\n(.*)\n```$", stripped, re.S)
+    inner = m.group(1) if m else stripped
+    lines = inner.splitlines()
+
+    # 문항 시작 패턴: "1) 정답: ②" 또는 "1) ②"
+    start_re = re.compile(r"^\s*\d+\)\s*(?:정답\s*[:：]?\s*)?[①-⑳]")
+    starts = [idx for idx, line in enumerate(lines) if start_re.match(line.strip())]
+
+    if not starts:
+        return [inner.strip()] if inner.strip() else []
+
+    chunks: List[str] = []
+    prefix = "\n".join(lines[: starts[0]]).strip()
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(lines)
+        chunk = "\n".join(lines[start:end]).strip()
+        if i == 0 and prefix:
+            chunk = f"{prefix}\n{chunk}".strip()
+        if chunk:
+            chunks.append(chunk)
+
+    return chunks
+
+
+def parse_pdf_question_chunk(chunk: str) -> Dict[str, str]:
+    lines = chunk.splitlines()
+    non_empty = [ln.strip() for ln in lines if ln.strip()]
+    first_line = non_empty[0] if non_empty else ""
+
+    qno = ""
+    ans = ""
+    q_match = re.match(r"^\s*(\d+\))\s*(?:정답\s*[:：]?\s*)?([①-⑳])?", first_line)
+    if q_match:
+        qno = (q_match.group(1) or "").strip()
+        ans = (q_match.group(2) or "").strip()
+
+    correct_lines: List[str] = []
+    wrong_lines: List[str] = []
+    lead_lines: List[str] = []
+    section = ""
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "[정답 해설]":
+            section = "correct"
+            continue
+        if stripped == "[오답 해설]":
+            section = "wrong"
+            continue
+
+        if section == "correct":
+            correct_lines.append(line)
+        elif section == "wrong":
+            wrong_lines.append(line)
+        else:
+            lead_lines.append(line)
+
+    return {
+        "question_no": qno,
+        "answer_symbol": ans,
+        "lead": "\n".join(lead_lines).strip(),
+        "correct": "\n".join(correct_lines).strip(),
+        "wrong": "\n".join(wrong_lines).strip(),
+        "raw": chunk.strip(),
+    }
+
+
+def build_pdf_chunk_copy_text(parsed: Dict[str, str], mode: str) -> str:
+    if mode == "정답 해설만":
+        return parsed.get("correct", "").strip() or parsed.get("raw", "").strip()
+    if mode == "오답 해설만":
+        return parsed.get("wrong", "").strip() or parsed.get("raw", "").strip()
+
+    parts: List[str] = []
+    lead = parsed.get("lead", "").strip()
+    if lead:
+        parts.append(lead)
+
+    correct = parsed.get("correct", "").strip()
+    if correct:
+        parts.append(f"[정답 해설]\n{correct}")
+
+    wrong = parsed.get("wrong", "").strip()
+    if wrong:
+        parts.append(f"[오답 해설]\n{wrong}")
+
+    if not parts:
+        return parsed.get("raw", "").strip()
+    return "\n\n".join(parts).strip()
+
+
+def find_next_incomplete(done_flags: List[bool], current_idx: int) -> int:
+    if not done_flags:
+        return 0
+
+    for i in range(current_idx + 1, len(done_flags)):
+        if not done_flags[i]:
+            return i
+    for i in range(0, len(done_flags)):
+        if not done_flags[i]:
+            return i
+    return current_idx
 
 
 # -------------------------------------------------
@@ -2537,6 +2677,106 @@ with tab_pdf:
             st.session_state["pdf_cleaned"] = remove_first_line_in_code_block(cleaned_block)
             st.rerun()
         st.markdown(st.session_state["pdf_cleaned"])
+        st.markdown("#### 🧩 문항별 작업")
+        chunks = split_pdf_cleaned_by_question(st.session_state["pdf_cleaned"])
+        if not chunks:
+            st.info("분리할 문항을 찾지 못했습니다.")
+        else:
+            chunk_source = "\n\n---\n\n".join(chunks)
+            if st.session_state.get("pdf_chunks_source") != chunk_source:
+                st.session_state["pdf_chunks_source"] = chunk_source
+                st.session_state["pdf_chunk_done"] = [False] * len(chunks)
+                st.session_state["pdf_focus_idx"] = 0
+
+            done_flags = st.session_state.get("pdf_chunk_done", [False] * len(chunks))
+            if len(done_flags) != len(chunks):
+                done_flags = [False] * len(chunks)
+                st.session_state["pdf_chunk_done"] = done_flags
+
+            focus_idx = int(st.session_state.get("pdf_focus_idx", 0))
+            if focus_idx < 0 or focus_idx >= len(chunks):
+                focus_idx = 0
+                st.session_state["pdf_focus_idx"] = 0
+
+            completed_cnt = sum(1 for x in done_flags if x)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("총 문항", len(chunks))
+            m2.metric("완료", completed_cnt)
+            m3.metric("미완료", len(chunks) - completed_cnt)
+            m4.metric("현재 문항", focus_idx + 1)
+
+            nav1, nav2, nav3 = st.columns([1, 1, 1])
+            with nav1:
+                if st.button("이전 문항", key="pdf_nav_prev"):
+                    st.session_state["pdf_focus_idx"] = max(0, focus_idx - 1)
+                    st.rerun()
+            with nav2:
+                if st.button("다음 문항", key="pdf_nav_next"):
+                    st.session_state["pdf_focus_idx"] = min(len(chunks) - 1, focus_idx + 1)
+                    st.rerun()
+            with nav3:
+                if st.button("다음 미완료로 이동", key="pdf_nav_next_incomplete"):
+                    st.session_state["pdf_focus_idx"] = find_next_incomplete(done_flags, focus_idx)
+                    st.rerun()
+
+            copy_mode = st.selectbox(
+                "복사 포맷",
+                ["전체", "정답 해설만", "오답 해설만"],
+                index=0,
+                key="pdf_copy_mode",
+            )
+            filter_mode = st.radio(
+                "표시 필터",
+                ["전체", "미완료만", "완료만"],
+                horizontal=True,
+                key="pdf_filter_mode",
+            )
+
+            target_indices: List[int] = []
+            for i, done in enumerate(done_flags):
+                if filter_mode == "전체":
+                    target_indices.append(i)
+                elif filter_mode == "미완료만" and not done:
+                    target_indices.append(i)
+                elif filter_mode == "완료만" and done:
+                    target_indices.append(i)
+
+            if not target_indices:
+                st.info("현재 필터에 해당하는 문항이 없습니다.")
+            else:
+                for i in target_indices:
+                    parsed = parse_pdf_question_chunk(chunks[i])
+                    q_display = parsed["question_no"] if parsed["question_no"] else f"{i + 1})"
+                    ans_display = f" / 정답 {parsed['answer_symbol']}" if parsed["answer_symbol"] else ""
+                    focus_tag = " (현재 작업)" if i == st.session_state.get("pdf_focus_idx", 0) else ""
+                    done_state = "완료" if done_flags[i] else "미완료"
+
+                    with st.container(border=True):
+                        st.markdown(f"**문항 {q_display}{ans_display} · {done_state}{focus_tag}**")
+                        c1, c2 = st.columns([1, 1])
+                        with c1:
+                            done_flags[i] = st.checkbox("완료 처리", value=done_flags[i], key=f"pdf_done_{i}")
+                        with c2:
+                            if st.button("이 문항으로 이동", key=f"pdf_focus_btn_{i}"):
+                                st.session_state["pdf_focus_idx"] = i
+                                st.rerun()
+
+                        copy_text = build_pdf_chunk_copy_text(parsed, copy_mode)
+                        st.code(copy_text, language="text")
+
+            st.session_state["pdf_chunk_done"] = done_flags
+
+            chunks_txt = "\n\n".join(
+                f"[문항 {idx + 1}]\n{build_pdf_chunk_copy_text(parse_pdf_question_chunk(chunk), copy_mode)}"
+                for idx, chunk in enumerate(chunks)
+            )
+            st.download_button(
+                "문항별 텍스트 다운로드 (.txt)",
+                data=chunks_txt,
+                file_name="pdf_cleaned_by_question.txt",
+                mime="text/plain",
+                key="pdf_chunks_download",
+            )
 
 
 # --- 특수 기호 조회 탭 ---
