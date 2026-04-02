@@ -1147,21 +1147,114 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
         action_current = st.session_state.get("en_work_action", action_key)
 
         st.markdown("### 📌 최종본 (강조 렌더링)")
-        st.info("**태그(굵게 등)가 포함된 부분은 드래그해서 직접 복사·붙여넣기 해주세요.**")
+        st.info("강조 렌더 영역은 복사 시 Streamlit wrapper는 제거하고, 필요한 HTML 태그만 유지해 TinyMCE에 넣을 수 있게 처리됩니다.")
         final_text = st.session_state.get("en_work_edit", result.output_text) or ""
 
         copy_payload = json.dumps(final_text)
+        render_payload = json.dumps(render_strong_html(final_text))
+        render_height = min(900, max(160, 90 + final_text.count("\n") * 26))
 
         # 최종본: 강조(strong)만 렌더, 밑줄 태그는 그대로 표시
-        render_fn = render_strong_html
-        st.markdown(
-            "<div id='en_final_render_box' style='background:#f7f7f7; border:1px solid #e5e5e5; "
-            "border-radius:8px; padding:12px; line-height:1.8; "
-            "font-weight:400; white-space: pre-wrap;'>"
-            "<style> strong{font-weight:800;} u{text-decoration-thickness:2px;} </style>"
-            f"{render_fn(final_text)}"
-            "</div>",
-            unsafe_allow_html=True,
+        st.components.v1.html(
+            f"""
+            <div style="display:flex; align-items:center; gap:8px; margin: 0 0 8px 0;">
+              <button id="en_render_copy_btn" type="button"
+                style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
+                강조 유지 복사
+              </button>
+              <span id="en_render_copy_msg" style="font-size:12px; color:#666;"></span>
+            </div>
+            <div id="en_final_render_box" style="background:#f7f7f7; border:1px solid #e5e5e5; border-radius:8px; padding:12px; line-height:1.8; font-weight:400; white-space:pre-wrap;">
+              <style>
+                strong {{ font-weight:800; }}
+                u {{ text-decoration-thickness:2px; }}
+              </style>
+            </div>
+            <script>
+              const renderBox = document.getElementById("en_final_render_box");
+              const renderCopyBtn = document.getElementById("en_render_copy_btn");
+              const renderCopyMsg = document.getElementById("en_render_copy_msg");
+              renderBox.innerHTML = {render_payload};
+
+              function buildClipboardPayload() {{
+                const selection = window.getSelection();
+                const hasSelection = selection && String(selection).length > 0;
+                const plainText = hasSelection ? String(selection) : renderBox.innerText;
+
+                const selectedRange = hasSelection && selection.rangeCount > 0
+                  ? selection.getRangeAt(0).cloneContents()
+                  : renderBox.cloneNode(true);
+                const wrapper = document.createElement("div");
+                wrapper.appendChild(selectedRange);
+
+                const allowed = new Set(["STRONG", "U", "BR"]);
+                wrapper.querySelectorAll("*").forEach((node) => {{
+                  if (allowed.has(node.tagName)) return;
+                  const fragment = document.createDocumentFragment();
+                  while (node.firstChild) fragment.appendChild(node.firstChild);
+                  node.replaceWith(fragment);
+                }});
+
+                return {{
+                  plainText,
+                  htmlText: wrapper.innerHTML,
+                }};
+              }}
+
+              renderBox.addEventListener("copy", (event) => {{
+                const {{ plainText, htmlText }} = buildClipboardPayload();
+                event.preventDefault();
+                event.clipboardData.setData("text/plain", plainText);
+                event.clipboardData.setData("text/html", htmlText);
+              }});
+
+              async function copyRenderedHtml() {{
+                const {{ plainText, htmlText }} = buildClipboardPayload();
+                try {{
+                  if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {{
+                    const item = new ClipboardItem({{
+                      "text/plain": new Blob([plainText], {{ type: "text/plain" }}),
+                      "text/html": new Blob([htmlText], {{ type: "text/html" }}),
+                    }});
+                    await navigator.clipboard.write([item]);
+                  }} else {{
+                    const tmp = document.createElement("div");
+                    tmp.contentEditable = "true";
+                    tmp.style.position = "fixed";
+                    tmp.style.left = "-9999px";
+                    tmp.style.top = "0";
+                    tmp.innerHTML = htmlText;
+                    document.body.appendChild(tmp);
+
+                    const range = document.createRange();
+                    range.selectNodeContents(tmp);
+                    const selection = window.getSelection();
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+
+                    const ok = document.execCommand("copy");
+                    selection.removeAllRanges();
+                    document.body.removeChild(tmp);
+
+                    if (!ok) {{
+                      throw new Error("execCommand copy failed");
+                    }}
+                  }}
+                  renderCopyMsg.textContent = "복사 완료";
+                  setTimeout(() => renderCopyMsg.textContent = "", 1200);
+                }} catch (error) {{
+                  renderCopyMsg.textContent = "복사 실패";
+                  console.error(error);
+                }}
+              }}
+
+              if (renderCopyBtn) {{
+                renderCopyBtn.addEventListener("click", copyRenderedHtml);
+              }}
+            </script>
+            """,
+            height=render_height,
+            scrolling=True,
         )
         # 최종본 텍스트 코드 블록 + 복사 버튼 (components: 안정적 실행)
         st.components.v1.html(
