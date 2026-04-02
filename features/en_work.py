@@ -1150,7 +1150,6 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
         st.info("강조 렌더 영역은 복사 시 Streamlit wrapper는 제거하고, 필요한 HTML 태그만 유지해 TinyMCE에 넣을 수 있게 처리됩니다.")
         final_text = st.session_state.get("en_work_edit", result.output_text) or ""
 
-        copy_payload = json.dumps(final_text)
         render_payload = json.dumps(render_strong_html(final_text))
         render_height = min(900, max(160, 90 + final_text.count("\n") * 26))
 
@@ -1256,43 +1255,6 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
             height=render_height,
             scrolling=True,
         )
-        # 최종본 텍스트 코드 블록 + 복사 버튼 (components: 안정적 실행)
-        st.components.v1.html(
-            f"""
-            <div style="display:flex; align-items:center; gap:8px; margin: 8px 0;">
-              <div style="font-weight:600;">📄 최종본 텍스트</div>
-              <button id="copy_btn" type="button"
-                style="padding:4px 8px; border-radius:6px; border:1px solid #ddd; background:#f5f5f5; cursor:pointer;">
-                복사
-              </button>
-              <span id="copy_msg" style="font-size:12px; color:#666;"></span>
-            </div>
-            <pre style="white-space:pre-wrap; background:#f7f7f7; border:1px solid #e5e5e5; border-radius:8px; padding:12px; max-height:240px; overflow:auto;">{html.escape(final_text)}</pre>
-            <script>
-              const text = {copy_payload};
-              const btn = document.getElementById("copy_btn");
-              const msg = document.getElementById("copy_msg");
-
-              async function doCopy() {{
-                try {{
-                  await navigator.clipboard.writeText(text);
-                  msg.textContent = "복사 완료!";
-                  setTimeout(()=>msg.textContent="", 1200);
-                }} catch (e) {{
-                  msg.textContent = "복사 실패";
-                  console.error(e);
-                }}
-              }}
-
-              if (btn) {{
-                btn.addEventListener("click", doCopy);
-              }}
-            </script>
-            """,
-            height=260,
-            scrolling=True,
-        )
-
         # 위젯 초기값 동기화: 새로운 실행 결과가 있으면 widget state를 초기화
         if "en_work_edit_area" not in st.session_state:
             st.session_state["en_work_edit_area"] = st.session_state.get("en_work_edit", result.output_text)
@@ -1300,7 +1262,6 @@ def render_en_work_tab(tab, st, *, review_english_text=None):
         edited = st.text_area(
             "아래 텍스트를 직접 수정할 수 있어요 (이 값이 최종본이 됩니다).",
             height=220,
-            value=st.session_state.get("en_work_edit", result.output_text),
             key="en_work_edit_area",
         )
         # text_area 값으로 편집 버퍼 업데이트 (복사/다운로드와 동기화)
