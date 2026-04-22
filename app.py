@@ -67,6 +67,8 @@ MAX_IMAGE_DIMENSION = 2200
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 FILE_REQUEST_COOLDOWN_SEC = 15
 RESOURCE_EXHAUSTED_RETRY_DELAYS = [10, 20]
+GLOBAL_GEMINI_MIN_INTERVAL_SEC = 5
+FILE_GEMINI_EXTRA_INTERVAL_SEC = 10
 
 
 def _get_session_id() -> str:
@@ -192,6 +194,28 @@ def _set_cached_gemini_result(cache_key: str, value):
     st.session_state["gemini_result_cache"][cache_key] = value
 
 
+def _apply_gemini_rate_limit(*, file_request: bool):
+    now = time.time()
+    last_any_ts = float(st.session_state.get("gemini_last_call_ts", 0.0) or 0.0)
+    global_wait = GLOBAL_GEMINI_MIN_INTERVAL_SEC - (now - last_any_ts)
+    if global_wait > 0:
+        st.caption(f"Gemini 호출 간격 조절: {global_wait:.1f}초 대기 후 요청합니다.")
+        time.sleep(global_wait)
+
+    if file_request:
+        now = time.time()
+        last_file_ts = float(st.session_state.get("gemini_last_file_call_ts", 0.0) or 0.0)
+        file_wait = FILE_GEMINI_EXTRA_INTERVAL_SEC - (now - last_file_ts)
+        if file_wait > 0:
+            st.caption(f"파일 요청 간격 조절: {file_wait:.1f}초 추가 대기 후 요청합니다.")
+            time.sleep(file_wait)
+
+    call_ts = time.time()
+    st.session_state["gemini_last_call_ts"] = call_ts
+    if file_request:
+        st.session_state["gemini_last_file_call_ts"] = call_ts
+
+
 def _accumulate_billing(feature: str, usage: dict, cost_usd: float):
     _ensure_session_accumulator()
     b = st.session_state["billing"]
@@ -291,6 +315,7 @@ def gemini_generate(feature: str, prompt: str, generation_config: dict):
     last_exc = None
     for attempt in range(len(RESOURCE_EXHAUSTED_RETRY_DELAYS) + 1):
         try:
+            _apply_gemini_rate_limit(file_request=False)
             resp = model.generate_content(prompt, generation_config=generation_config)
             latency_ms = int((time.time() - t0) * 1000)
 
@@ -337,6 +362,7 @@ def gemini_generate_with_files(
     last_exc = None
     for attempt in range(len(RESOURCE_EXHAUSTED_RETRY_DELAYS) + 1):
         try:
+            _apply_gemini_rate_limit(file_request=True)
             resp = None
             parts: list = []
             try:
