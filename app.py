@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import base64
 import csv
+import hashlib
 import io
 import json
 import time
@@ -14,6 +15,7 @@ from typing import Dict, Any, List
 from datetime import datetime, timezone
 import uuid
 import traceback
+from PIL import Image, ImageOps
 from features.ko_work import render_ko_work_tab
 from features.en_work import render_en_work_tab
 from output_schema import CLASSIFY_PROMPT_TEMPLATE, get_classify_schema_text
@@ -21,6 +23,7 @@ from output_schema import CLASSIFY_PROMPT_TEMPLATE, get_classify_schema_text
 
 import streamlit as st
 import google.generativeai as genai
+from google.api_core import exceptions as google_api_exceptions
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -60,6 +63,10 @@ if not API_KEY:
 genai.configure(api_key=API_KEY)
 MODEL_NAME = "gemini-2.0-flash-001"
 model = genai.GenerativeModel(MODEL_NAME)
+MAX_IMAGE_DIMENSION = 2200
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+FILE_REQUEST_COOLDOWN_SEC = 15
+RESOURCE_EXHAUSTED_RETRY_DELAYS = [10, 20]
 
 
 def _get_session_id() -> str:
@@ -144,6 +151,47 @@ def _ensure_session_accumulator():
         }
 
 
+def _ensure_gemini_result_cache():
+    if "gemini_result_cache" not in st.session_state:
+        st.session_state["gemini_result_cache"] = {}
+
+
+def _make_gemini_cache_key(
+    feature: str,
+    prompt: str,
+    generation_config: dict,
+    *,
+    files: list[tuple[bytes, str]] | None = None,
+) -> str:
+    payload = {
+        "feature": feature,
+        "prompt": prompt,
+        "generation_config": generation_config,
+        "files": [],
+    }
+    if files:
+        for data, mime_type in files:
+            payload["files"].append(
+                {
+                    "mime_type": mime_type,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "size": len(data),
+                }
+            )
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _get_cached_gemini_result(cache_key: str):
+    _ensure_gemini_result_cache()
+    return st.session_state["gemini_result_cache"].get(cache_key)
+
+
+def _set_cached_gemini_result(cache_key: str, value):
+    _ensure_gemini_result_cache()
+    st.session_state["gemini_result_cache"][cache_key] = value
+
+
 def _accumulate_billing(feature: str, usage: dict, cost_usd: float):
     _ensure_session_accumulator()
     b = st.session_state["billing"]
@@ -215,6 +263,17 @@ def _log_event(feature: str, status: str, latency_ms: int, usage: dict, cost_usd
         ws.append_row(values, value_input_option="RAW")
 
 
+def _classify_gemini_error(exc: Exception) -> str:
+    if isinstance(exc, google_api_exceptions.ResourceExhausted):
+        msg = str(exc).lower()
+        if "quota" in msg:
+            return "quota_exceeded"
+        if "429" in msg or "rate" in msg:
+            return "rate_limited"
+        return "resource_exhausted"
+    return "error"
+
+
 def gemini_generate(feature: str, prompt: str, generation_config: dict):
     """
     ✅ 모든 Gemini 호출은 반드시 여기로 통일:
@@ -223,24 +282,41 @@ def gemini_generate(feature: str, prompt: str, generation_config: dict):
     - 세션 누적
     - 시트 로그
     """
+    cache_key = _make_gemini_cache_key(feature, prompt, generation_config)
+    cached = _get_cached_gemini_result(cache_key)
+    if cached is not None:
+        return cached
+
     t0 = time.time()
-    try:
-        resp = model.generate_content(prompt, generation_config=generation_config)
-        latency_ms = int((time.time() - t0) * 1000)
+    last_exc = None
+    for attempt in range(len(RESOURCE_EXHAUSTED_RETRY_DELAYS) + 1):
+        try:
+            resp = model.generate_content(prompt, generation_config=generation_config)
+            latency_ms = int((time.time() - t0) * 1000)
 
-        usage = _extract_token_usage(resp)
-        cost_usd = calc_gemini_flash_cost_usd(usage["prompt_tokens"], usage["output_tokens"])
+            usage = _extract_token_usage(resp)
+            cost_usd = calc_gemini_flash_cost_usd(usage["prompt_tokens"], usage["output_tokens"])
 
-        _accumulate_billing(feature, usage, cost_usd)
-        _log_event(feature, "ok", latency_ms, usage, cost_usd, "")
+            _accumulate_billing(feature, usage, cost_usd)
+            _log_event(feature, "ok", latency_ms, usage, cost_usd, "")
+            _set_cached_gemini_result(cache_key, resp)
+            return resp
+        except Exception as e:
+            last_exc = e
+            is_retryable = isinstance(e, google_api_exceptions.ResourceExhausted)
+            has_next_retry = attempt < len(RESOURCE_EXHAUSTED_RETRY_DELAYS)
+            if is_retryable and has_next_retry:
+                wait_sec = RESOURCE_EXHAUSTED_RETRY_DELAYS[attempt]
+                st.warning(f"Gemini 요청 한도에 걸려 {wait_sec}초 후 자동 재시도합니다. ({attempt + 1}/{len(RESOURCE_EXHAUSTED_RETRY_DELAYS) + 1})")
+                time.sleep(wait_sec)
+                continue
 
-        return resp
+            latency_ms = int((time.time() - t0) * 1000)
+            usage = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            _log_event(feature, _classify_gemini_error(e), latency_ms, usage, 0.0, str(e))
+            raise
 
-    except Exception as e:
-        latency_ms = int((time.time() - t0) * 1000)
-        usage = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        _log_event(feature, "error", latency_ms, usage, 0.0, str(e))
-        raise
+    raise last_exc
 
 
 def gemini_generate_with_files(
@@ -252,62 +328,168 @@ def gemini_generate_with_files(
     """
     ✅ 파일 입력이 필요한 Gemini 호출도 정산/로깅 통일
     """
+    cache_key = _make_gemini_cache_key(feature, prompt, generation_config, files=files)
+    cached = _get_cached_gemini_result(cache_key)
+    if cached is not None:
+        return cached
+
     t0 = time.time()
-    try:
-        resp = None
-        parts: list = []
+    last_exc = None
+    for attempt in range(len(RESOURCE_EXHAUSTED_RETRY_DELAYS) + 1):
         try:
-            types_mod = getattr(genai, "types", None)
-            part_cls = getattr(types_mod, "Part", None) if types_mod else None
-            if part_cls:
-                for data, mime_type in files:
-                    parts.append(part_cls.from_data(data=data, mime_type=mime_type))
-        except Exception:
-            parts = []
-
-        if parts:
-            resp = model.generate_content([prompt, *parts], generation_config=generation_config)
-        else:
-            upload_refs = []
-            tmp_paths: list[str] = []
+            resp = None
+            parts: list = []
             try:
-                for data, mime_type in files:
-                    suffix = ""
-                    if mime_type == "application/pdf":
-                        suffix = ".pdf"
-                    elif mime_type == "image/png":
-                        suffix = ".png"
-                    elif mime_type == "image/jpeg":
-                        suffix = ".jpg"
-                    elif mime_type == "image/webp":
-                        suffix = ".webp"
+                types_mod = getattr(genai, "types", None)
+                part_cls = getattr(types_mod, "Part", None) if types_mod else None
+                if part_cls:
+                    for data, mime_type in files:
+                        parts.append(part_cls.from_data(data=data, mime_type=mime_type))
+            except Exception:
+                parts = []
 
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                        tmp.write(data)
-                        tmp_paths.append(tmp.name)
+            if parts:
+                resp = model.generate_content([prompt, *parts], generation_config=generation_config)
+            else:
+                upload_refs = []
+                tmp_paths: list[str] = []
+                try:
+                    for data, mime_type in files:
+                        suffix = ""
+                        if mime_type == "application/pdf":
+                            suffix = ".pdf"
+                        elif mime_type == "image/png":
+                            suffix = ".png"
+                        elif mime_type == "image/jpeg":
+                            suffix = ".jpg"
+                        elif mime_type == "image/webp":
+                            suffix = ".webp"
 
-                for path in tmp_paths:
-                    upload_refs.append(genai.upload_file(path))
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                            tmp.write(data)
+                            tmp_paths.append(tmp.name)
 
-                resp = model.generate_content([prompt, *upload_refs], generation_config=generation_config)
-            finally:
-                for path in tmp_paths:
-                    if path and os.path.exists(path):
-                        os.unlink(path)
-        latency_ms = int((time.time() - t0) * 1000)
+                    for path in tmp_paths:
+                        upload_refs.append(genai.upload_file(path))
 
-        usage = _extract_token_usage(resp)
-        cost_usd = calc_gemini_flash_cost_usd(usage["prompt_tokens"], usage["output_tokens"])
+                    resp = model.generate_content([prompt, *upload_refs], generation_config=generation_config)
+                finally:
+                    for path in tmp_paths:
+                        if path and os.path.exists(path):
+                            os.unlink(path)
+            latency_ms = int((time.time() - t0) * 1000)
 
-        _accumulate_billing(feature, usage, cost_usd)
-        _log_event(feature, "ok", latency_ms, usage, cost_usd, "")
+            usage = _extract_token_usage(resp)
+            cost_usd = calc_gemini_flash_cost_usd(usage["prompt_tokens"], usage["output_tokens"])
 
-        return resp
-    except Exception as e:
-        latency_ms = int((time.time() - t0) * 1000)
-        usage = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        _log_event(feature, "error", latency_ms, usage, 0.0, str(e))
-        raise
+            _accumulate_billing(feature, usage, cost_usd)
+            _log_event(feature, "ok", latency_ms, usage, cost_usd, "")
+            _set_cached_gemini_result(cache_key, resp)
+            return resp
+        except Exception as e:
+            last_exc = e
+            is_retryable = isinstance(e, google_api_exceptions.ResourceExhausted)
+            has_next_retry = attempt < len(RESOURCE_EXHAUSTED_RETRY_DELAYS)
+            if is_retryable and has_next_retry:
+                wait_sec = RESOURCE_EXHAUSTED_RETRY_DELAYS[attempt]
+                st.warning(f"Gemini 요청 한도에 걸려 {wait_sec}초 후 자동 재시도합니다. ({attempt + 1}/{len(RESOURCE_EXHAUSTED_RETRY_DELAYS) + 1})")
+                time.sleep(wait_sec)
+                continue
+
+            latency_ms = int((time.time() - t0) * 1000)
+            usage = {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            _log_event(feature, _classify_gemini_error(e), latency_ms, usage, 0.0, str(e))
+            raise
+
+    raise last_exc
+
+
+def _format_upload_size_mb(files: list[tuple[bytes, str]]) -> str:
+    total_bytes = sum(len(data) for data, _ in files)
+    return f"{total_bytes / (1024 * 1024):.1f}MB"
+
+
+def _show_gemini_request_error(exc: Exception, *, files: list[tuple[bytes, str]] | None = None):
+    file_note = ""
+    if files:
+        file_note = f" 현재 요청은 파일 {len(files)}개, 총 {_format_upload_size_mb(files)}입니다."
+
+    if isinstance(exc, google_api_exceptions.ResourceExhausted):
+        st.error(
+            "Gemini 요청 한도에 도달해 이번 작업을 처리하지 못했습니다. "
+            "잠시 후 다시 시도하거나 업로드 파일 수를 줄여서 나눠 실행해주세요."
+            f"{file_note}"
+        )
+        return
+
+    st.error(f"Gemini 호출 중 오류가 발생했습니다: {exc}")
+
+
+def _check_feature_cooldown(feature: str, label: str, cooldown_sec: int = FILE_REQUEST_COOLDOWN_SEC) -> bool:
+    state_key = f"{feature}_last_request_ts"
+    now = time.time()
+    last_ts = float(st.session_state.get(state_key, 0.0) or 0.0)
+    remaining = cooldown_sec - (now - last_ts)
+    if remaining > 0:
+        st.warning(f"{label}은(는) 연속 호출을 막기 위해 {int(remaining) + 1}초 후 다시 실행할 수 있습니다.")
+        return False
+    st.session_state[state_key] = now
+    return True
+
+
+def _render_feature_request_status(feature: str, label: str, cooldown_sec: int = FILE_REQUEST_COOLDOWN_SEC):
+    last_ts = float(st.session_state.get(f"{feature}_last_request_ts", 0.0) or 0.0)
+    if not last_ts:
+        st.caption(f"{label} 최근 요청: 아직 없음")
+        return
+
+    elapsed = max(0, int(time.time() - last_ts))
+    remaining = max(0, cooldown_sec - elapsed)
+    if remaining > 0:
+        st.caption(f"{label} 최근 요청: {elapsed}초 전 · 남은 쿨다운: {remaining}초")
+    else:
+        st.caption(f"{label} 최근 요청: {elapsed}초 전 · 지금 다시 실행 가능")
+
+
+def _maybe_downsize_image_bytes(data: bytes, mime_type: str) -> tuple[bytes, str]:
+    if mime_type not in {"image/png", "image/jpeg", "image/webp"}:
+        return data, mime_type
+
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img = ImageOps.exif_transpose(img)
+            width, height = img.size
+            longest_edge = max(width, height)
+            if longest_edge <= MAX_IMAGE_DIMENSION and len(data) <= MAX_IMAGE_BYTES:
+                return data, mime_type
+
+            scale = min(1.0, MAX_IMAGE_DIMENSION / float(longest_edge))
+            new_size = (
+                max(1, int(round(width * scale))),
+                max(1, int(round(height * scale))),
+            )
+            if new_size != img.size:
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+            if mime_type == "image/jpeg":
+                if img.mode not in ("RGB", "L"):
+                    img = img.convert("RGB")
+                out = io.BytesIO()
+                img.save(out, format="JPEG", quality=85, optimize=True)
+                return out.getvalue(), mime_type
+
+            if mime_type == "image/webp":
+                if img.mode not in ("RGB", "RGBA", "L"):
+                    img = img.convert("RGB")
+                out = io.BytesIO()
+                img.save(out, format="WEBP", quality=85, method=6)
+                return out.getvalue(), mime_type
+
+            out = io.BytesIO()
+            img.save(out, format="PNG", optimize=True)
+            return out.getvalue(), mime_type
+    except Exception:
+        return data, mime_type
 
 
 # -------------------------------------------------
@@ -679,6 +861,8 @@ def _build_classify_html(rows: list[dict]) -> str:
 def _build_classify_html_from_json(items: list[dict]) -> str:
     cards = []
     for item in items:
+        if not isinstance(item, dict):
+            continue
         qnum = str(item.get("question_num") or "").strip()
         group_prompt = str(item.get("group_prompt") or "").strip()
         passage = str(item.get("passage") or "").strip()
@@ -1287,52 +1471,47 @@ def highlight_selected_punctuation(source_text: str, selected_keys: list[str]) -
 
 
 # -------------------------------------------------
-# ✅ Gemini(JSON) 분석 호출: 이제 feature를 받도록만 수정 (정산용)
+# ✅ Gemini(JSON) 분석 호출: gemini_generate의 재시도/캐시만 사용
 # -------------------------------------------------
-def analyze_text_with_gemini(prompt: str, feature: str, max_retries: int = 5) -> dict:
-    last_error: Exception | None = None
+def analyze_text_with_gemini(prompt: str, feature: str) -> dict:
+    try:
+        generation_config = {
+            "response_mime_type": "application/json",
+            "temperature": 0.0,
+        }
 
-    for attempt in range(max_retries):
-        try:
-            generation_config = {
-                "response_mime_type": "application/json",
-                "temperature": 0.0,
+        response = gemini_generate(feature, prompt, generation_config=generation_config)
+
+        raw = getattr(response, "text", None)
+        if raw is None or not str(raw).strip():
+            return {
+                "suspicion_score": 5,
+                "content_typo_report": "AI 응답이 비어 있습니다.",
+                "translated_typo_report": "",
+                "markdown_report": "",
             }
 
-            response = gemini_generate(feature, prompt, generation_config=generation_config)
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return {
+                "suspicion_score": 5,
+                "content_typo_report": f"AI 응답이 dict가 아님 (type={type(obj).__name__})",
+                "translated_typo_report": "",
+                "markdown_report": "",
+            }
 
-            raw = getattr(response, "text", None)
-            if raw is None or not str(raw).strip():
-                return {
-                    "suspicion_score": 5,
-                    "content_typo_report": "AI 응답이 비어 있습니다.",
-                    "translated_typo_report": "",
-                    "markdown_report": "",
-                }
+        return obj
+    except Exception as e:
+        print(f"[Gemini] 호출 오류: {e}")
+        error_tag = _classify_gemini_error(e)
+        if error_tag in {"rate_limited", "quota_exceeded", "resource_exhausted"}:
+            error_msg = f"API 호출 실패({error_tag}): {e}"
+        else:
+            error_msg = f"API 호출 실패: {e}"
 
-            obj = json.loads(raw)
-            if not isinstance(obj, dict):
-                return {
-                    "suspicion_score": 5,
-                    "content_typo_report": f"AI 응답이 dict가 아님 (type={type(obj).__name__})",
-                    "translated_typo_report": "",
-                    "markdown_report": "",
-                }
-
-            return obj
-
-        except Exception as e:
-            last_error = e
-            wait_time = 5 * (attempt + 1)
-            print(f"[Gemini] 호출 오류 (시도 {attempt+1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                print(f"→ {wait_time}초 후 재시도")
-                time.sleep(wait_time)
-
-    print("[Gemini] 최대 재시도 횟수 초과.")
     return {
         "suspicion_score": 5,
-        "content_typo_report": f"API 호출 실패: {last_error}",
+        "content_typo_report": error_msg,
         "translated_typo_report": "",
         "markdown_report": "",
     }
@@ -2418,6 +2597,9 @@ with tab_en:
 with tab_classify:
     st.subheader("🧩 문항 분류 (PDF/이미지)")
     st.caption("PDF/이미지를 업로드하면 구성 요소를 JSON으로 분류해 카드로 제공합니다. 원기호 번호는 그대로 유지됩니다.")
+    st.caption("이미지는 긴 변 2200px 또는 약 2MB를 넘는 경우에만 보수적으로 축소해 전송합니다. PDF는 축소하지 않습니다.")
+    st.caption("요청 한도 초과 시 10초, 20초 간격으로 최대 2회 자동 재시도하며, 실행 버튼에는 15초 쿨다운이 적용됩니다.")
+    _render_feature_request_status("item_classify", "문항 분류")
 
     uploaded_files = st.file_uploader(
         "PDF 또는 이미지 업로드 (여러 파일 가능, 업로드 순서=페이지 순서)",
@@ -2521,6 +2703,8 @@ with tab_classify:
         if not uploaded_files and not st.session_state["classify_paste_images"]:
             st.warning("먼저 PDF 또는 이미지를 업로드하거나 클립보드 이미지를 붙여넣어주세요.")
             st.stop()
+        if not _check_feature_cooldown("item_classify", "문항 분류"):
+            st.stop()
 
         file_payloads: list[tuple[bytes, str]] = []
         if uploaded_files:
@@ -2536,26 +2720,33 @@ with tab_classify:
                         mime_type = "image/jpeg"
                     elif name_lower.endswith(".webp"):
                         mime_type = "image/webp"
-                file_payloads.append((f.getvalue(), mime_type))
+                file_bytes = f.getvalue()
+                file_bytes, mime_type = _maybe_downsize_image_bytes(file_bytes, mime_type)
+                file_payloads.append((file_bytes, mime_type))
 
         if st.session_state["classify_paste_images"]:
-            file_payloads.extend(st.session_state["classify_paste_images"])
+            for data, mime_type in st.session_state["classify_paste_images"]:
+                data, mime_type = _maybe_downsize_image_bytes(data, mime_type)
+                file_payloads.append((data, mime_type))
 
         prompt = CLASSIFY_PROMPT_TEMPLATE.format(
             all_relevant_texts="(첨부된 PDF/이미지 참조)",
             json_schema=get_classify_schema_text(),
         )
 
-        with st.spinner("Gemini가 문항을 분류하는 중입니다..."):
-            response = gemini_generate_with_files(
-                feature="item_classify",
-                prompt=prompt,
-                files=file_payloads,
-                generation_config={"temperature": 0.0},
-            )
-
-        json_text = _extract_json_block(getattr(response, "text", "") or "")
-        st.session_state["classify_json"] = json_text
+        try:
+            with st.spinner("Gemini가 문항을 분류하는 중입니다..."):
+                response = gemini_generate_with_files(
+                    feature="item_classify",
+                    prompt=prompt,
+                    files=file_payloads,
+                    generation_config={"temperature": 0.0},
+                )
+        except Exception as exc:
+            _show_gemini_request_error(exc, files=file_payloads)
+        else:
+            json_text = _extract_json_block(getattr(response, "text", "") or "")
+            st.session_state["classify_json"] = json_text
 
     classify_json = st.session_state.get("classify_json", "")
     if classify_json:
@@ -2566,13 +2757,22 @@ with tab_classify:
             st.info("JSON 파싱에 실패했습니다. 아래 원문을 확인해주세요.")
             st.code(classify_json)
         else:
-            items = parsed.get("items") if isinstance(parsed, dict) else None
+            items = parsed.get("items") if isinstance(parsed, dict) else parsed if isinstance(parsed, list) else None
             if not isinstance(items, list):
                 st.info("JSON 구조가 스키마와 다릅니다. 아래 원문을 확인해주세요.")
                 st.code(classify_json)
             else:
-                html_doc = _build_classify_html_from_json(items)
-                st.components.v1.html(html_doc, height=900, scrolling=True)
+                valid_items = [item for item in items if isinstance(item, dict)]
+                invalid_count = len(items) - len(valid_items)
+                if invalid_count:
+                    st.warning(f"분류 결과 항목 {invalid_count}개는 형식이 올바르지 않아 표시에서 제외했습니다.")
+
+                if not valid_items:
+                    st.info("표시할 수 있는 문항 데이터가 없습니다. 아래 원문을 확인해주세요.")
+                    st.code(classify_json)
+                else:
+                    html_doc = _build_classify_html_from_json(valid_items)
+                    st.components.v1.html(html_doc, height=900, scrolling=True)
 
         st.markdown("#### 📄 JSON 다운로드")
         st.download_button(
@@ -2587,6 +2787,9 @@ with tab_classify:
 with tab_parts:
     st.subheader("🧷 국어 문항 요소 분해")
     st.caption("국어 시험지 PDF/이미지에서 지시문, 발문, 선지, 답란, <보기>, <조건>, 각주를 분리합니다.")
+    st.caption("이미지는 긴 변 2200px 또는 약 2MB를 넘는 경우에만 보수적으로 축소해 전송합니다. PDF는 축소하지 않습니다.")
+    st.caption("요청 한도 초과 시 10초, 20초 간격으로 최대 2회 자동 재시도하며, 실행 버튼에는 15초 쿨다운이 적용됩니다.")
+    _render_feature_request_status("kor_item_parts", "문항 요소 분해")
 
     parts_file = st.file_uploader(
         "PDF 또는 이미지 업로드",
@@ -2604,6 +2807,8 @@ with tab_parts:
         if not parts_file:
             st.warning("먼저 PDF 또는 이미지를 업로드해주세요.")
         else:
+            if not _check_feature_cooldown("kor_item_parts", "문항 요소 분해"):
+                st.stop()
             mime_type = parts_file.type or "application/octet-stream"
             if mime_type == "application/octet-stream":
                 name_lower = (parts_file.name or "").lower()
@@ -2617,17 +2822,22 @@ with tab_parts:
                     mime_type = "image/webp"
 
             file_bytes = parts_file.getvalue()
+            file_bytes, mime_type = _maybe_downsize_image_bytes(file_bytes, mime_type)
 
-            with st.spinner("Gemini가 문항 요소를 분해하는 중입니다..."):
-                response = gemini_generate_with_files(
-                    feature="kor_item_parts",
-                    prompt=KOR_PARTS_SYSTEM_PROMPT,
-                    files=[(file_bytes, mime_type)],
-                    generation_config={"temperature": 0.0},
-                )
-
-            csv_text = _extract_csv_block(getattr(response, "text", "") or "")
-            st.session_state["parts_csv"] = csv_text
+            file_payloads = [(file_bytes, mime_type)]
+            try:
+                with st.spinner("Gemini가 문항 요소를 분해하는 중입니다..."):
+                    response = gemini_generate_with_files(
+                        feature="kor_item_parts",
+                        prompt=KOR_PARTS_SYSTEM_PROMPT,
+                        files=file_payloads,
+                        generation_config={"temperature": 0.0},
+                    )
+            except Exception as exc:
+                _show_gemini_request_error(exc, files=file_payloads)
+            else:
+                csv_text = _extract_csv_block(getattr(response, "text", "") or "")
+                st.session_state["parts_csv"] = csv_text
 
     parts_csv = st.session_state.get("parts_csv", "")
     if parts_csv:
