@@ -34,6 +34,7 @@ from google.oauth2.service_account import Credentials
 # ==========================
 LOG_SHEET_ID = st.secrets.get("LOG_SHEET_ID")
 LOG_WORKSHEET_NAME = st.secrets.get("LOG_WORKSHEET", "usage_log_worker")
+PROMPT_WORKSHEET_NAME = st.secrets.get("PROMPT_WORKSHEET", "prompt_config")
 LOGGING_ENABLED = bool(LOG_SHEET_ID)
 
 # ✅ 헤더는 반드시 이 순서/개수로만 기록
@@ -85,7 +86,7 @@ def calc_gemini_flash_cost_usd(prompt_tokens: int, output_tokens: int) -> float:
 
 
 @st.cache_resource
-def _get_log_worksheet():
+def _get_spreadsheet():
     if not LOGGING_ENABLED:
         return None
 
@@ -99,8 +100,20 @@ def _get_log_worksheet():
             ],
         )
         gc = gspread.authorize(creds)
-        sh = gc.open_by_key(LOG_SHEET_ID)
+        return gc.open_by_key(LOG_SHEET_ID)
+    except Exception as e:
+        st.error(f"[LOG] spreadsheet init failed: {e}")
+        st.code(traceback.format_exc())
+        return None
 
+
+@st.cache_resource
+def _get_log_worksheet():
+    sh = _get_spreadsheet()
+    if sh is None:
+        return None
+
+    try:
         # 1) 워크시트 가져오기 (없으면 생성)
         try:
             ws = sh.worksheet(LOG_WORKSHEET_NAME)
@@ -117,6 +130,42 @@ def _get_log_worksheet():
         st.error(f"[LOG] worksheet init failed: {e}")
         st.code(traceback.format_exc())
         return None
+
+
+@st.cache_data(ttl=60)
+def _get_prompt_rows():
+    sh = _get_spreadsheet()
+    if sh is None:
+        return []
+
+    try:
+        ws = sh.worksheet(PROMPT_WORKSHEET_NAME)
+        return ws.get_all_records()
+    except gspread.exceptions.WorksheetNotFound:
+        st.warning(f"프롬프트 워크시트 '{PROMPT_WORKSHEET_NAME}'를 찾지 못해 기본 프롬프트를 사용합니다.")
+        return []
+    except Exception as e:
+        st.warning(f"프롬프트 시트를 불러오지 못해 기본 프롬프트를 사용합니다: {e}")
+        return []
+
+
+def get_active_prompt_text(feature_key: str, default_prompt: str) -> str:
+    rows = _get_prompt_rows()
+    if not rows:
+        return default_prompt
+
+    active_rows = []
+    for row in rows:
+        key = str(row.get("feature_key", "")).strip()
+        status = str(row.get("status", "")).strip().lower()
+        prompt_text = str(row.get("prompt_text", "") or "").strip()
+        if key == feature_key and status == "active" and prompt_text:
+            active_rows.append(row)
+
+    if not active_rows:
+        return default_prompt
+
+    return str(active_rows[-1].get("prompt_text", "")).strip() or default_prompt
 
 
 # ==========================
@@ -671,7 +720,10 @@ PDF_RESTORE_SYSTEM_PROMPT = """
 # -------------------------------------------------
 # 문항 분류용 프롬프트 + 유틸
 # -------------------------------------------------
-ITEM_CLASSIFY_SYSTEM_PROMPT = ""
+DEFAULT_ITEM_CLASSIFY_PROMPT = CLASSIFY_PROMPT_TEMPLATE.format(
+    all_relevant_texts="(첨부된 PDF/이미지 참조)",
+    json_schema=get_classify_schema_text(),
+)
 
 KOR_PARTS_SYSTEM_PROMPT = """
 너는 국어 시험지 PDF/이미지에서 텍스트를 읽어 구조를 분해하는 도우미이다.
@@ -694,6 +746,8 @@ KOR_PARTS_SYSTEM_PROMPT = """
 8) 작품명이 없으면 작가/작품명/지문_앞3문장/지문_뒤3문장을 빈칸으로 둔다.
 9) 한 문항에 여러 구분이 있으면 행을 여러 개로 나눠라.
 """
+
+DEFAULT_KOR_PARTS_SYSTEM_PROMPT = KOR_PARTS_SYSTEM_PROMPT
 
 
 def _extract_csv_block(text: str) -> str:
@@ -1074,8 +1128,9 @@ def restore_pdf_text(raw_text: str) -> str:
         return ""
 
     preprocessed_text = normalize_arrow_connectors(raw_text)
+    system_prompt = get_active_prompt_text("pdf_restore", PDF_RESTORE_SYSTEM_PROMPT)
 
-    prompt = f"""{PDF_RESTORE_SYSTEM_PROMPT}
+    prompt = f"""{system_prompt}
 
 ----------------------------------------
 아래는 PDF에서 복사해온 원본 텍스트이다.
@@ -2755,10 +2810,7 @@ with tab_classify:
                 data, mime_type = _maybe_downsize_image_bytes(data, mime_type)
                 file_payloads.append((data, mime_type))
 
-        prompt = CLASSIFY_PROMPT_TEMPLATE.format(
-            all_relevant_texts="(첨부된 PDF/이미지 참조)",
-            json_schema=get_classify_schema_text(),
-        )
+        prompt = get_active_prompt_text("item_classify", DEFAULT_ITEM_CLASSIFY_PROMPT)
 
         try:
             with st.spinner("Gemini가 문항을 분류하는 중입니다..."):
@@ -2855,7 +2907,7 @@ with tab_parts:
                 with st.spinner("Gemini가 문항 요소를 분해하는 중입니다..."):
                     response = gemini_generate_with_files(
                         feature="kor_item_parts",
-                        prompt=KOR_PARTS_SYSTEM_PROMPT,
+                        prompt=get_active_prompt_text("kor_item_parts", DEFAULT_KOR_PARTS_SYSTEM_PROMPT),
                         files=file_payloads,
                         generation_config={"temperature": 0.0},
                     )
@@ -3168,6 +3220,7 @@ OCR 텍스트를 과목 기준에 맞게 **들여쓰기/줄바꿈** 형태로 �
 **주요 기능**
 - 원기호/원문자 통일 및 괄호 정리  
 - 정답 라벨 정렬 (A/a)  
+
 - 양자택일 괄호 변경 + 라벨 부여  
 - 괄호 안 단어 배열 정규화  
 - 보기 단어배열 정리  
