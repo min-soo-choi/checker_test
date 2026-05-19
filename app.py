@@ -2401,11 +2401,10 @@ st.set_page_config(page_title="AI 검수기 (Gemini)", page_icon="📚", layout=
 st.title("📚 Delta 작업자 Test (Gemini 기반)")
 st.caption("한국어/영어 단일 텍스트 + 해설 양식 변환 (오탈자/형식 위주, 스타일 제안 금지).")
 
-tab_ko_work, tab_en_work, tab_parts, tab_pdf, tab_symbols, tab_about, tab_debug = st.tabs(
+tab_ko_work, tab_en_work, tab_pdf, tab_symbols, tab_about, tab_debug = st.tabs(
     [
         "🧰 국어 작업",
         "🧰 영어 작업",
-        "🧷 국어 문항 요소",
         "📄 해설 텍스트 정리",
         "🔣 특수 기호 조회",
         "ℹ️ 설명",
@@ -2424,80 +2423,6 @@ render_en_work_tab(
     st,
     review_english_text=review_english_text,
 )
-
-
-# --- 국어 문항 요소 분해 탭 ---
-with tab_parts:
-    st.subheader("🧷 국어 문항 요소 분해")
-    st.caption("국어 시험지 PDF/이미지에서 지시문, 발문, 선지, 답란, <보기>, <조건>, 각주를 분리합니다.")
-    st.caption("이미지는 긴 변 2200px 또는 약 2MB를 넘는 경우에만 보수적으로 축소해 전송합니다. PDF는 축소하지 않습니다.")
-    st.caption("요청 한도 초과 시 10초, 20초 간격으로 최대 2회 자동 재시도하며, 실행 버튼에는 15초 쿨다운이 적용됩니다.")
-    _render_feature_request_status("kor_item_parts", "문항 요소 분해")
-
-    parts_file = st.file_uploader(
-        "PDF 또는 이미지 업로드",
-        type=["pdf", "png", "jpg", "jpeg", "webp"],
-        key="parts_file",
-    )
-
-    col_p1, col_p2 = st.columns([1, 1])
-    with col_p1:
-        run_parts = st.button("문항 요소 분해 실행", type="primary", key="parts_run")
-    with col_p2:
-        st.caption("CSV 헤더: 페이지,문항번호,구분,내용,작가,작품명,지문_앞3문장,지문_뒤3문장")
-
-    if run_parts:
-        if not parts_file:
-            st.warning("먼저 PDF 또는 이미지를 업로드해주세요.")
-        else:
-            if not _check_feature_cooldown("kor_item_parts", "문항 요소 분해"):
-                st.stop()
-            mime_type = parts_file.type or "application/octet-stream"
-            if mime_type == "application/octet-stream":
-                name_lower = (parts_file.name or "").lower()
-                if name_lower.endswith(".pdf"):
-                    mime_type = "application/pdf"
-                elif name_lower.endswith(".png"):
-                    mime_type = "image/png"
-                elif name_lower.endswith(".jpg") or name_lower.endswith(".jpeg"):
-                    mime_type = "image/jpeg"
-                elif name_lower.endswith(".webp"):
-                    mime_type = "image/webp"
-
-            file_bytes = parts_file.getvalue()
-            file_bytes, mime_type = _maybe_downsize_image_bytes(file_bytes, mime_type)
-
-            file_payloads = [(file_bytes, mime_type)]
-            try:
-                with st.spinner("Gemini가 문항 요소를 분해하는 중입니다..."):
-                    response = gemini_generate_with_files(
-                        feature="kor_item_parts",
-                        prompt=get_active_prompt_text("kor_item_parts", DEFAULT_KOR_PARTS_SYSTEM_PROMPT),
-                        files=file_payloads,
-                        generation_config={"temperature": 0.0},
-                    )
-            except Exception as exc:
-                _show_gemini_request_error(exc, files=file_payloads)
-            else:
-                csv_text = _extract_csv_block(getattr(response, "text", "") or "")
-                st.session_state["parts_csv"] = csv_text
-
-    parts_csv = st.session_state.get("parts_csv", "")
-    if parts_csv:
-        st.markdown("#### ✅ 분해 결과")
-        rows = _parse_csv_rows(parts_csv)
-        if rows:
-            st.dataframe(rows, use_container_width=True)
-        else:
-            st.info("CSV 파싱에 실패했습니다. 아래 원문을 확인해주세요.")
-            st.code(parts_csv)
-
-        st.download_button(
-            "CSV 다운로드",
-            data=parts_csv,
-            file_name="kor_item_parts.csv",
-            mime="text/csv",
-        )
 
 
 # --- PDF 텍스트 정리 탭 ---
