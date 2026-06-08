@@ -128,6 +128,7 @@ streamlit run app.py
 
 ```toml
 GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
+GEMINI_MODEL_NAME = "gemini-2.5-flash-lite"  # optional, gemini-2.0-flash-*는 사용하지 않음
 
 # (선택) 정산/로깅용 Google Sheets
 LOG_SHEET_ID = "YOUR_SHEET_ID"

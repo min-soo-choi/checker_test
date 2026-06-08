@@ -62,7 +62,22 @@ if not API_KEY:
     st.stop()
 
 genai.configure(api_key=API_KEY)
-MODEL_NAME = "gemini-2.0-flash-001"
+DEFAULT_MODEL_NAME = "gemini-2.5-flash-lite"
+DEPRECATED_GEMINI_MODEL_NAMES = {
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+}
+
+
+def _resolve_gemini_model_name(raw_model) -> str:
+    model_name = str(raw_model or DEFAULT_MODEL_NAME).strip() or DEFAULT_MODEL_NAME
+    bare_model_name = model_name.removeprefix("models/")
+    if bare_model_name in DEPRECATED_GEMINI_MODEL_NAMES:
+        return DEFAULT_MODEL_NAME
+    return bare_model_name
+
+
+MODEL_NAME = _resolve_gemini_model_name(st.secrets.get("GEMINI_MODEL_NAME", DEFAULT_MODEL_NAME))
 model = genai.GenerativeModel(MODEL_NAME)
 MAX_IMAGE_DIMENSION = 2200
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
@@ -78,10 +93,19 @@ def _get_session_id() -> str:
     return st.session_state["session_id"]
 
 
-def calc_gemini_flash_cost_usd(prompt_tokens: int, output_tokens: int) -> float:
-    # Gemini 2.0 Flash (Standard) - text pricing (앱 내부 기준값)
-    in_cost_per_1m = 0.10
-    out_cost_per_1m = 0.40
+MODEL_PRICING_USD_PER_1M = {
+    "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-2.5-flash": (0.30, 2.50),
+    "gemini-3.5-flash": (1.50, 9.00),
+}
+
+
+def calc_gemini_cost_usd(prompt_tokens: int, output_tokens: int) -> float:
+    # 앱 내부 정산용 기준값. 알 수 없는 모델은 기본 저비용 모델 단가로 계산한다.
+    in_cost_per_1m, out_cost_per_1m = MODEL_PRICING_USD_PER_1M.get(
+        MODEL_NAME,
+        MODEL_PRICING_USD_PER_1M[DEFAULT_MODEL_NAME],
+    )
     return (prompt_tokens / 1_000_000) * in_cost_per_1m + (output_tokens / 1_000_000) * out_cost_per_1m
 
 
@@ -292,6 +316,20 @@ def _accumulate_billing(feature: str, usage: dict, cost_usd: float):
     f["cost_usd"] += float(cost_usd or 0.0)
 
 
+def _sanitize_gemini_log_error(error: str) -> str:
+    text = error or ""
+    lowered = text.lower()
+    if (
+        "gemini-2.0-flash" in lowered
+        and ("no longer available" in lowered or "not found" in lowered or "shut down" in lowered)
+    ):
+        return (
+            "model_not_found: deprecated Gemini 2.0 Flash model is no longer available. "
+            f"Use {DEFAULT_MODEL_NAME} or another supported model."
+        )
+    return text
+
+
 def _log_event(feature: str, status: str, latency_ms: int, usage: dict, cost_usd: float, error: str = ""):
     """
     ✅ Gemini 호출 1회에 대한 로그를 Google Sheets에 기록 (헤더 고정)
@@ -314,7 +352,7 @@ def _log_event(feature: str, status: str, latency_ms: int, usage: dict, cost_usd
         int(usage.get("output_tokens", 0) or 0),
         int(usage.get("total_tokens", 0) or 0),
         float(cost_usd or 0.0),
-        (error or "")[:500],
+        _sanitize_gemini_log_error(error)[:500],
     ]
     # 헤더(1행) 아래에서 첫 빈 행을 찾아 기록하고, 없으면 새 행을 추가한다.
     try:
@@ -337,6 +375,8 @@ def _log_event(feature: str, status: str, latency_ms: int, usage: dict, cost_usd
 
 
 def _classify_gemini_error(exc: Exception) -> str:
+    if isinstance(exc, google_api_exceptions.NotFound):
+        return "model_not_found"
     if isinstance(exc, google_api_exceptions.ResourceExhausted):
         msg = str(exc).lower()
         if "quota" in msg:
@@ -369,7 +409,7 @@ def gemini_generate(feature: str, prompt: str, generation_config: dict):
             latency_ms = int((time.time() - t0) * 1000)
 
             usage = _extract_token_usage(resp)
-            cost_usd = calc_gemini_flash_cost_usd(usage["prompt_tokens"], usage["output_tokens"])
+            cost_usd = calc_gemini_cost_usd(usage["prompt_tokens"], usage["output_tokens"])
 
             _accumulate_billing(feature, usage, cost_usd)
             _log_event(feature, "ok", latency_ms, usage, cost_usd, "")
@@ -455,7 +495,7 @@ def gemini_generate_with_files(
             latency_ms = int((time.time() - t0) * 1000)
 
             usage = _extract_token_usage(resp)
-            cost_usd = calc_gemini_flash_cost_usd(usage["prompt_tokens"], usage["output_tokens"])
+            cost_usd = calc_gemini_cost_usd(usage["prompt_tokens"], usage["output_tokens"])
 
             _accumulate_billing(feature, usage, cost_usd)
             _log_event(feature, "ok", latency_ms, usage, cost_usd, "")
@@ -488,6 +528,14 @@ def _show_gemini_request_error(exc: Exception, *, files: list[tuple[bytes, str]]
     file_note = ""
     if files:
         file_note = f" 현재 요청은 파일 {len(files)}개, 총 {_format_upload_size_mb(files)}입니다."
+
+    if isinstance(exc, google_api_exceptions.NotFound):
+        st.error(
+            "Gemini 모델을 찾을 수 없거나 현재 API에서 지원하지 않습니다. "
+            f"현재 설정된 모델은 `{MODEL_NAME}`입니다. "
+            "Streamlit Secrets의 `GEMINI_MODEL_NAME` 값을 지원되는 모델명으로 바꾸거나 비워두면 기본 모델을 사용합니다."
+        )
+        return
 
     if isinstance(exc, google_api_exceptions.ResourceExhausted):
         st.error(
@@ -2445,8 +2493,12 @@ with tab_pdf:
         else:
             text_to_send = pdf_raw_text.strip() if auto_trim_pdf else pdf_raw_text
             with st.spinner("Gemini가 텍스트를 정리하는 중입니다..."):
-                cleaned_block = restore_pdf_text(text_to_send)
-            st.session_state["pdf_cleaned"] = cleaned_block
+                try:
+                    cleaned_block = restore_pdf_text(text_to_send)
+                except Exception as e:
+                    _show_gemini_request_error(e)
+                else:
+                    st.session_state["pdf_cleaned"] = cleaned_block
 
     cleaned_block = st.session_state.get("pdf_cleaned")
     if cleaned_block:
